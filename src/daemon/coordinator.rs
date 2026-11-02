@@ -16,7 +16,7 @@ use serde_json::json;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::Config;
-use crate::db::{self, AttemptRow};
+use crate::db::{self, AttemptRow, JobRow};
 use crate::domain::{
     self, AttemptId, AttemptState, JobId, JobState, SCHEDULER_SEMANTICS_VERSION, now_ms,
 };
@@ -100,6 +100,7 @@ pub struct Coordinator {
     config: Config,
     paths: Paths,
     started_at: i64,
+    boot_id: String,
     /// Set when persisted scheduler semantics cannot be interpreted; blocks
     /// all ordinary admission until an operator intervenes.
     admission_blocked: Option<String>,
@@ -122,7 +123,7 @@ impl Coordinator {
     pub fn new(conn: Connection, config: Config, paths: Paths) -> Result<Self> {
         // Fail fast if /proc identity primitives are unavailable; every
         // recovery decision depends on them.
-        identity::boot_id().context("reading boot id")?;
+        let boot_id = identity::boot_id().context("reading boot id")?;
         let published_revision = db::latest_event_id(&conn)?;
         // Receivers are handed out by `revisions()`; the initial one is
         // dropped because a daemon with no subscribers is the normal case.
@@ -132,6 +133,7 @@ impl Coordinator {
             config,
             paths,
             started_at: now_ms(),
+            boot_id,
             admission_blocked: None,
             spawned: HashMap::new(),
             orphan_term_sent: HashSet::new(),
@@ -326,6 +328,48 @@ impl Coordinator {
                     .collect();
                 Ok(Reply::Events { events })
             }
+            Op::Classes => Ok(Reply::Classes {
+                classes: db::classes(&self.conn)?,
+            }),
+            Op::DefaultJob { command } => Ok(Reply::DefaultJob {
+                job: db::default_for_command(&self.conn, command)?
+                    .map(|job| views::job_view(&self.conn, &self.paths, &job, false))
+                    .transpose()?,
+            }),
+            Op::Attempts { job, before, limit } => {
+                if before.is_some_and(|number| number <= 0) || !(1..=100).contains(limit) {
+                    return Err(ApiError::new(
+                        error_codes::INVALID_ARGUMENT,
+                        "attempts requires before > 0 and limit between 1 and 100",
+                    ));
+                }
+                db::job_row(&self.conn, *job)?.ok_or_else(|| api_not_found(*job))?;
+                let mut rows = db::attempts_page(&self.conn, *job, *before, limit + 1)?;
+                let has_more = rows.len() > *limit as usize;
+                if has_more {
+                    rows.pop();
+                }
+                let next_before = if has_more {
+                    rows.last().map(|row| row.number)
+                } else {
+                    None
+                };
+                Ok(Reply::Attempts {
+                    attempts: rows
+                        .iter()
+                        .map(|row| views::attempt_view(&self.paths, row))
+                        .collect(),
+                    next_before,
+                })
+            }
+            Op::ClassShow { name } => {
+                let class = require_class(&self.conn, name)?;
+                let jobs = db::class_jobs(&self.conn, name)?
+                    .iter()
+                    .map(|job| views::job_view(&self.conn, &self.paths, job, false))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Reply::ClassJobs { class, jobs })
+            }
             Op::Show { job } => {
                 let row = db::job_row(&self.conn, *job)?.ok_or_else(|| {
                     ApiError::new(error_codes::NOT_FOUND, format!("job {job} not found"))
@@ -348,9 +392,9 @@ impl Coordinator {
             Op::Logs { job, attempt } => {
                 let attempt_row = match attempt {
                     Some(number) => db::attempt_by_number(&self.conn, *job, *number)?,
-                    None => db::attempts_for_job(&self.conn, *job)?
+                    None => db::attempts_page(&self.conn, *job, None, 1)?
                         .into_iter()
-                        .next_back(),
+                        .next(),
                 }
                 .ok_or_else(|| {
                     ApiError::new(
@@ -415,12 +459,20 @@ impl Coordinator {
                     format!("idempotency key {key:?} was already used with a different request"),
                 ));
             }
-            let reply = serde_json::from_str(&stored_response).map_err(|err| {
+            let mut reply = serde_json::from_str(&stored_response).map_err(|err| {
                 ApiError::new(
                     error_codes::INTERNAL,
                     format!("stored response corrupt: {err}"),
                 )
             })?;
+            if views::compact_mutation_history(&mut reply) {
+                db::compact_operation_response(
+                    &self.conn,
+                    key,
+                    &serde_json::to_string(&reply)
+                        .map_err(|err| ApiError::new(error_codes::INTERNAL, err.to_string()))?,
+                )?;
+            }
             return Ok(reply);
         }
 
@@ -434,7 +486,8 @@ impl Coordinator {
         let now = now_ms();
         let (reply, actions) = {
             let tx = self.conn.transaction().map_err(ApiError::from)?;
-            let (reply, actions) = apply_mutation(&tx, &self.paths, op, now)?;
+            let (mut reply, actions) = apply_mutation(&tx, &self.paths, op, now)?;
+            views::compact_mutation_history(&mut reply);
             let encoded = serde_json::to_string(&reply)
                 .map_err(|err| ApiError::new(error_codes::INTERNAL, err.to_string()))?;
             db::insert_operation(&tx, key, op.kind(), &hash, &encoded, now)?;
@@ -530,6 +583,10 @@ impl Coordinator {
             Ok(None) => {}
         }
 
+        if self.recover_rebooted_default(attempt, &dir)? {
+            return Ok(());
+        }
+
         // Republish committed cancellation intent (crash between commit and
         // publication, or daemon restart).
         if attempt.cancel_requested
@@ -571,6 +628,57 @@ impl Coordinator {
             AttemptState::Quarantined => Ok(()),
             _ => Ok(()),
         }
+    }
+
+    fn recover_rebooted_default(
+        &mut self,
+        attempt: &AttemptRow,
+        dir: &std::path::Path,
+    ) -> Result<bool> {
+        if !matches!(
+            attempt.state,
+            AttemptState::Authorized | AttemptState::Running | AttemptState::Orphaned
+        ) || !attempt
+            .runner_boot_id
+            .as_deref()
+            .is_some_and(|boot| boot != self.boot_id)
+        {
+            return Ok(false);
+        }
+        let job = db::job_row(&self.conn, attempt.job_id)?.context("job of rebooted attempt")?;
+        if !job.is_default || job.state.is_terminal() || job.state == JobState::Held {
+            return Ok(false);
+        }
+        // A changed boot ID proves the old group is gone. Keep committed
+        // timeouts and user cancellation instead of treating them as reboot loss.
+        let timeout = match artifacts::read_artifact::<TimeoutFile>(&dir.join(TIMEOUT_FILE)) {
+            Ok(Some(file)) if file.token == attempt.launch_token => true,
+            Ok(None) => attempt.timed_out_at.is_some(),
+            Ok(Some(_)) => {
+                self.quarantine(attempt, "timeout artifact token mismatch")?;
+                return Ok(true);
+            }
+            Err(err) => {
+                self.quarantine(attempt, &format!("corrupt timeout artifact: {err}"))?;
+                return Ok(true);
+            }
+        };
+        let state = if timeout {
+            AttemptState::Failed
+        } else if attempt.cancel_requested {
+            AttemptState::Cancelled
+        } else {
+            AttemptState::Lost
+        };
+        self.finalize_attempt_and_job(
+            attempt,
+            state,
+            None,
+            None,
+            Some("previous boot ended; process group is gone"),
+            "daemon",
+        )?;
+        Ok(true)
     }
 
     fn republish_time_limit(&self, attempt: &AttemptRow, dir: &std::path::Path) {
@@ -847,9 +955,19 @@ impl Coordinator {
             return self.quarantine(attempt, "orphaned attempt lacks command identity");
         };
         let job = db::job_row(&self.conn, attempt.job_id)?.context("job of orphaned attempt")?;
-        let policy_deadline = match (attempt.command_started_at, job.time_limit_ms) {
+        let limit_deadline = match (attempt.command_started_at, job.time_limit_ms) {
             (Some(started_at), Some(limit)) => started_at.checked_add(limit),
             _ => None,
+        };
+        let policy_deadline = match (limit_deadline, attempt.window_end_at) {
+            (Some(limit), Some(window)) => Some(limit.min(window)),
+            (limit, window) => limit.or(window),
+        };
+        let limit_set_at = if policy_deadline.is_some() && policy_deadline == attempt.window_end_at
+        {
+            None
+        } else {
+            job.time_limit_set_at
         };
         // The runner records a timeout it has already started. That commitment
         // outlives both the runner and a later edit of the job's limit.
@@ -876,7 +994,7 @@ impl Coordinator {
         } else if let Some(deadline) = deadline.filter(|_| deadline_expired) {
             if attempt.cancel_requested {
                 attempt.cancel_requested_at.is_some_and(|cancelled_at| {
-                    domain::timeout_wins_over_cancel(cancelled_at, deadline, job.time_limit_set_at)
+                    domain::timeout_wins_over_cancel(cancelled_at, deadline, limit_set_at)
                 })
             } else {
                 true
@@ -892,7 +1010,11 @@ impl Coordinator {
             let (state, message) = if timed_out {
                 (
                     AttemptState::Failed,
-                    "time limit exceeded; orphaned process group drained",
+                    if deadline == attempt.window_end_at && attempt.window_end_at.is_some() {
+                        "run window closed; orphaned process group drained"
+                    } else {
+                        "time limit exceeded; orphaned process group drained"
+                    },
                 )
             } else if attempt.cancel_requested {
                 (
@@ -926,7 +1048,7 @@ impl Coordinator {
             let anchor = if let Some(file) = &committed {
                 file.observed_at
             } else {
-                let anchor = domain::timeout_kill_anchor(deadline, job.time_limit_set_at, None);
+                let anchor = domain::timeout_kill_anchor(deadline, limit_set_at, None);
                 let record = TimeoutFile {
                     token: attempt.launch_token.clone(),
                     deadline,
@@ -954,7 +1076,7 @@ impl Coordinator {
             // Escalation still uses the deadline that was already in force, or
             // the installation time of a limit moved into the past.
             let deadline = deadline.expect("expired deadline");
-            let anchor = domain::timeout_kill_anchor(deadline, job.time_limit_set_at, None);
+            let anchor = domain::timeout_kill_anchor(deadline, limit_set_at, None);
             if self.orphan_term_sent.insert(attempt.id) {
                 unsafe {
                     libc::killpg(pgid, libc::SIGTERM);
@@ -1033,7 +1155,9 @@ impl Coordinator {
             ResultOutcome::LaunchFailed | ResultOutcome::AuthorizationTimeout => {
                 (AttemptState::Failed, result.message.clone())
             }
-            ResultOutcome::TimedOut => (AttemptState::Failed, result.message.clone()),
+            ResultOutcome::TimedOut | ResultOutcome::WindowClosed => {
+                (AttemptState::Failed, result.message.clone())
+            }
             ResultOutcome::Cancelled => (AttemptState::Cancelled, result.message.clone()),
         };
         self.finalize_attempt_and_job(
@@ -1074,7 +1198,22 @@ impl Coordinator {
             )?;
             let job = db::job_row(&tx, attempt.job_id)?.context("job of finalized attempt")?;
             if !job.state.is_terminal() {
+                let attempts_used = if job.is_default {
+                    db::default_failure_count(&tx, job.id)?
+                } else {
+                    job.attempt_count
+                };
                 match state {
+                    _ if should_restart_default(
+                        &job,
+                        attempt,
+                        state,
+                        &self.boot_id,
+                        attempts_used,
+                    ) =>
+                    {
+                        requeue_default(&tx, &job, now, "default job ready for another idle run")?;
+                    }
                     AttemptState::Succeeded => {
                         db::update_job_state(&tx, job.id, JobState::Succeeded, None, now)?;
                         db::append_event(&tx, Some(job.id), None, "job_succeeded", actor, None)?;
@@ -1088,9 +1227,14 @@ impl Coordinator {
                         db::append_event(&tx, Some(job.id), None, "job_lost", actor, None)?;
                     }
                     AttemptState::Failed => {
-                        if job.attempt_count < job.max_attempts && !attempt.cancel_requested {
+                        if attempts_used < job.max_attempts && !attempt.cancel_requested {
+                            let retry_delay = if job.is_default {
+                                job.retry_delay_ms.max(1_000)
+                            } else {
+                                job.retry_delay_ms
+                            };
                             let not_before =
-                                (job.retry_delay_ms > 0).then(|| now + job.retry_delay_ms);
+                                (retry_delay > 0).then(|| now.saturating_add(retry_delay));
                             db::update_job_state(&tx, job.id, JobState::Queued, message, now)?;
                             db::set_job_retry_not_before(&tx, job.id, not_before, now)?;
                             db::clear_job_readiness(&tx, job.id, now)?;
@@ -1192,6 +1336,21 @@ impl Coordinator {
         };
 
         let eligible = db::eligible_candidates(&self.conn, now)?;
+        if eligible.iter().any(|candidate| !candidate.is_default) {
+            // Commit the yield before signalling. Keep the lease until the
+            // default exits; cancellation recovery handles daemon restarts.
+            if let Some(default) = db::default_job(&self.conn)?
+                && let Some(attempt) = db::live_attempt_for_job(&self.conn, default.id)?
+            {
+                let tx = self.conn.transaction()?;
+                let actions = request_default_yield(&tx, &default, &attempt, now)?;
+                tx.commit()?;
+                for action in actions {
+                    self.perform(action);
+                }
+                return Ok(());
+            }
+        }
         let active: Vec<_> = leases.iter().map(|(_, lease)| lease.clone()).collect();
         let outcome = scheduler::plan_pass(&active, &eligible, snapshot.as_ref());
         // A freeze is only persisted when the reservation outlives the pass;
@@ -1442,6 +1601,7 @@ impl Coordinator {
                         cancel_grace_ms: self.config.cancel_grace_ms,
                         poll_ms: self.config.runner_poll_ms,
                         time_limit_ms: job.time_limit_ms.map(|value| value as u64),
+                        window_end_at: attempt.window_end_at,
                     },
                     true,
                 )?;
@@ -1574,8 +1734,54 @@ fn invalidate_reservation_if_protected(
 fn job_reply(tx: &Transaction<'_>, paths: &Paths, job: JobId) -> ApiResult<Reply> {
     let row = db::job_row(tx, job)?.ok_or_else(|| api_not_found(job))?;
     Ok(Reply::Job {
-        job: views::job_view(tx, paths, &row, true)?,
+        job: views::job_view(tx, paths, &row, false)?,
     })
+}
+
+fn class_reply(conn: &Connection, name: &str) -> ApiResult<(Reply, Vec<PostAction>)> {
+    Ok((
+        Reply::Class {
+            class: require_class(conn, name)?,
+        },
+        Vec::new(),
+    ))
+}
+
+fn append_class_event(tx: &Transaction<'_>, kind: &str, details: serde_json::Value) -> Result<()> {
+    db::append_event(tx, None, None, kind, "client", Some(&details.to_string()))?;
+    Ok(())
+}
+
+fn validate_class_name(name: &str) -> ApiResult<()> {
+    if name.is_empty()
+        || name.len() > 128
+        || !name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
+    {
+        return Err(ApiError::new(
+            error_codes::INVALID_ARGUMENT,
+            "class name must contain 1-128 ASCII letters, digits, dots, underscores, or hyphens",
+        ));
+    }
+    Ok(())
+}
+
+fn require_class(conn: &Connection, name: &str) -> ApiResult<protocol::ClassView> {
+    validate_class_name(name)?;
+    db::class_row(conn, name)?
+        .ok_or_else(|| ApiError::new(error_codes::NOT_FOUND, format!("class {name:?} not found")))
+}
+
+fn require_editable_policy(tx: &Transaction<'_>, job: JobId) -> ApiResult<JobRow> {
+    let row = db::job_row(tx, job)?.ok_or_else(|| api_not_found(job))?;
+    if !matches!(row.state, JobState::Queued | JobState::Held) {
+        return Err(ApiError::new(
+            error_codes::INVALID_STATE,
+            "class membership and run windows can only be changed for queued or held jobs",
+        ));
+    }
+    Ok(row)
 }
 
 fn apply_mutation(
@@ -1585,7 +1791,215 @@ fn apply_mutation(
     now: i64,
 ) -> ApiResult<(Reply, Vec<PostAction>)> {
     match op {
+        Op::DefaultEnd { force } => {
+            let row = db::default_for_control(tx)?.ok_or_else(|| {
+                ApiError::new(error_codes::NOT_FOUND, "no default job configured")
+            })?;
+            let actions = if row.state.is_terminal() {
+                Vec::new()
+            } else {
+                cancel_job(tx, row.id, *force, now)?
+            };
+            Ok((job_reply(tx, paths, row.id)?, actions))
+        }
+        Op::DefaultStart => {
+            let row = db::default_for_control(tx)?.ok_or_else(|| {
+                ApiError::new(error_codes::NOT_FOUND, "no default job configured")
+            })?;
+            let live = db::live_attempt_for_job(tx, row.id)?;
+            if row.state == JobState::NeedsAttention
+                || live.as_ref().is_some_and(|attempt| {
+                    attempt.cancel_requested
+                        || matches!(
+                            attempt.state,
+                            AttemptState::Orphaned | AttemptState::Quarantined
+                        )
+                })
+            {
+                return Err(ApiError::new(
+                    error_codes::INVALID_STATE,
+                    "default is still stopping or needs recovery; wait for it to stop or resolve recovery before starting",
+                ));
+            }
+            if matches!(
+                row.state,
+                JobState::Queued | JobState::Starting | JobState::Running
+            ) {
+                return Ok((job_reply(tx, paths, row.id)?, Vec::new()));
+            }
+            if live.is_some()
+                || db::active_leases(tx)?
+                    .iter()
+                    .any(|(_, lease)| lease.job_id == row.id)
+                || row.state == JobState::Skipped
+            {
+                return Err(ApiError::new(
+                    error_codes::INVALID_STATE,
+                    "default has unresolved work and cannot be started",
+                ));
+            }
+            db::update_job_state(tx, row.id, JobState::Queued, None, now)?;
+            db::set_job_retry_not_before(tx, row.id, None, now)?;
+            db::clear_job_readiness(tx, row.id, now)?;
+            db::advance_dependency_graph(tx, now)?;
+            db::append_event(tx, Some(row.id), None, "default_started", "client", None)?;
+            Ok((job_reply(tx, paths, row.id)?, Vec::new()))
+        }
+        Op::ClassCreate { name, run_window } => {
+            validate_class_name(name)?;
+            if db::class_row(tx, name)?.is_some() {
+                return Err(ApiError::new(
+                    error_codes::INVALID_STATE,
+                    format!("class {name:?} already exists"),
+                ));
+            }
+            tx.execute(
+                "INSERT INTO job_classes (name, run_window, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?3)",
+                rusqlite::params![name, run_window.as_ref().map(ToString::to_string), now],
+            )?;
+            append_class_event(
+                tx,
+                "class_created",
+                json!({ "class": name, "runWindow": run_window }),
+            )?;
+            class_reply(tx, name)
+        }
+        Op::ClassPause { name, paused } => {
+            let class = require_class(tx, name)?;
+            if class.paused != *paused {
+                tx.execute(
+                    "UPDATE job_classes SET paused = ?2, updated_at = ?3 WHERE name = ?1",
+                    rusqlite::params![name, paused, now],
+                )?;
+                if *paused {
+                    for job in db::class_jobs(tx, name)? {
+                        invalidate_reservation_if_protected(
+                            tx,
+                            job.id,
+                            "protected job's class was paused",
+                            now,
+                        )?;
+                    }
+                }
+                append_class_event(
+                    tx,
+                    if *paused {
+                        "class_paused"
+                    } else {
+                        "class_unpaused"
+                    },
+                    json!({ "class": name }),
+                )?;
+            }
+            class_reply(tx, name)
+        }
+        Op::ClassSetWindow { name, run_window } => {
+            let class = require_class(tx, name)?;
+            if class.run_window != *run_window {
+                let jobs = db::class_jobs(tx, name)?;
+                for job in &jobs {
+                    if db::live_attempt_for_job(tx, job.id)?.is_some() {
+                        return Err(ApiError::new(
+                            error_codes::INVALID_STATE,
+                            "cannot edit a class window while it has live attempts; pause and drain the class first",
+                        ));
+                    }
+                }
+                tx.execute(
+                    "UPDATE job_classes SET run_window = ?2, updated_at = ?3 WHERE name = ?1",
+                    rusqlite::params![name, run_window.as_ref().map(ToString::to_string), now],
+                )?;
+                for job in jobs {
+                    invalidate_reservation_if_protected(
+                        tx,
+                        job.id,
+                        "protected job's class window changed",
+                        now,
+                    )?;
+                }
+                append_class_event(
+                    tx,
+                    "class_window_changed",
+                    json!({ "class": name, "runWindow": run_window }),
+                )?;
+            }
+            class_reply(tx, name)
+        }
+        Op::ClassCancel { name, force } => {
+            let class = require_class(tx, name)?;
+            let mut actions = Vec::new();
+            // Unsafe members roll back the request before any side effects.
+            for job in db::class_jobs(tx, name)? {
+                // A parent's cancellation may have skipped this member.
+                let current = db::job_row(tx, job.id)?.ok_or_else(|| api_not_found(job.id))?;
+                if !current.state.is_terminal() {
+                    actions.extend(cancel_job(tx, job.id, *force, now)?);
+                }
+            }
+            append_class_event(
+                tx,
+                "class_cancel_requested",
+                json!({ "class": name, "force": force }),
+            )?;
+            Ok((Reply::Class { class }, actions))
+        }
+        Op::SetClass { job, class } => {
+            let row = require_editable_policy(tx, *job)?;
+            if let Some(name) = class {
+                require_class(tx, name)?;
+            }
+            if row.class != *class {
+                invalidate_reservation_if_protected(
+                    tx,
+                    *job,
+                    "protected job's class changed",
+                    now,
+                )?;
+                tx.execute(
+                    "UPDATE jobs SET class = ?2, updated_at = ?3 WHERE id = ?1",
+                    rusqlite::params![job, class, now],
+                )?;
+                db::append_event(
+                    tx,
+                    Some(*job),
+                    None,
+                    "job_class_changed",
+                    "client",
+                    Some(&json!({ "class": class }).to_string()),
+                )?;
+            }
+            Ok((job_reply(tx, paths, *job)?, Vec::new()))
+        }
+        Op::SetRunWindow { job, run_window } => {
+            let row = require_editable_policy(tx, *job)?;
+            if row.run_window != *run_window {
+                invalidate_reservation_if_protected(
+                    tx,
+                    *job,
+                    "protected job's run window changed",
+                    now,
+                )?;
+                tx.execute(
+                    "UPDATE jobs SET run_window = ?2, updated_at = ?3 WHERE id = ?1",
+                    rusqlite::params![job, run_window.as_ref().map(ToString::to_string), now],
+                )?;
+                db::append_event(
+                    tx,
+                    Some(*job),
+                    None,
+                    "job_window_changed",
+                    "client",
+                    Some(&json!({ "runWindow": run_window }).to_string()),
+                )?;
+            }
+            Ok((job_reply(tx, paths, *job)?, Vec::new()))
+        }
         Op::Submit(params) => {
+            validate_default_submission(tx, params)?;
+            if let Some(name) = &params.class {
+                require_class(tx, name)?;
+            }
             validate_submission_parents(tx, params)?;
             let job = db::insert_job(tx, params, now)?;
             db::append_event(
@@ -1600,6 +2014,9 @@ fn apply_mutation(
                         "maxParallelRuns": params.max_parallel_runs,
                         "priority": params.priority,
                         "timeLimitMs": params.time_limit_ms,
+                        "class": params.class,
+                        "runWindow": params.run_window,
+                        "isDefault": params.is_default,
                     })
                     .to_string(),
                 ),
@@ -1608,7 +2025,7 @@ fn apply_mutation(
             let row = db::job_row(tx, job)?.ok_or_else(|| api_not_found(job))?;
             Ok((
                 Reply::Submitted {
-                    job: views::job_view(tx, paths, &row, true)?,
+                    job: views::job_view(tx, paths, &row, false)?,
                 },
                 Vec::new(),
             ))
@@ -1650,6 +2067,12 @@ fn apply_mutation(
         }
         Op::Retry { job } => {
             let row = db::job_row(tx, *job)?.ok_or_else(|| api_not_found(*job))?;
+            if row.is_default && db::default_job(tx)?.is_some_and(|default| default.id != row.id) {
+                return Err(ApiError::new(
+                    error_codes::INVALID_STATE,
+                    "another default job is already configured",
+                ));
+            }
             if !row.state.is_retryable() {
                 return Err(ApiError::new(
                     error_codes::INVALID_STATE,
@@ -1677,6 +2100,12 @@ fn apply_mutation(
                 ));
             }
             let row = db::job_row(tx, *job)?.ok_or_else(|| api_not_found(*job))?;
+            if row.is_default && *max_parallel_runs != 1 {
+                return Err(ApiError::new(
+                    error_codes::INVALID_ARGUMENT,
+                    "default jobs must have maxParallelRuns=1",
+                ));
+            }
             if !matches!(
                 row.state,
                 JobState::Queued
@@ -1965,6 +2394,126 @@ fn apply_mutation(
     }
 }
 
+fn should_restart_default(
+    job: &JobRow,
+    attempt: &AttemptRow,
+    state: AttemptState,
+    boot_id: &str,
+    failures: i64,
+) -> bool {
+    if !job.is_default || job.state.is_terminal() || job.state == JobState::Held {
+        return false;
+    }
+    attempt.yield_requested
+        || (!attempt.cancel_requested
+            && (state == AttemptState::Succeeded
+                || (state == AttemptState::Lost
+                    && failures < job.max_attempts
+                    && attempt
+                        .runner_boot_id
+                        .as_deref()
+                        .is_some_and(|boot| boot != boot_id))))
+}
+
+fn requeue_default(tx: &Transaction<'_>, job: &JobRow, now: i64, reason: &str) -> Result<()> {
+    db::update_job_state(tx, job.id, JobState::Queued, Some(reason), now)?;
+    // Delay short-lived commands to avoid a restart loop.
+    db::set_job_retry_not_before(
+        tx,
+        job.id,
+        Some(now.saturating_add(job.retry_delay_ms.max(1_000))),
+        now,
+    )?;
+    db::clear_job_readiness(tx, job.id, now)?;
+    db::append_event(tx, Some(job.id), None, "default_requeued", "daemon", None)?;
+    Ok(())
+}
+
+fn request_default_yield(
+    tx: &Transaction<'_>,
+    job: &JobRow,
+    attempt: &AttemptRow,
+    now: i64,
+) -> Result<Vec<PostAction>> {
+    anyhow::ensure!(
+        job.is_default,
+        "only the default job may yield automatically"
+    );
+    // Preserve user cancellation and leave quarantined attempts for recovery.
+    if attempt.yield_requested
+        || attempt.cancel_requested
+        || attempt.state == AttemptState::Quarantined
+    {
+        return Ok(Vec::new());
+    }
+    tx.execute(
+        "UPDATE attempts SET yield_requested = 1 WHERE id = ?1",
+        [attempt.id],
+    )?;
+    db::set_attempt_cancel_requested(tx, attempt.id, true, now)?;
+    db::append_event(
+        tx,
+        Some(job.id),
+        Some(attempt.id),
+        "default_yield_requested",
+        "daemon",
+        None,
+    )?;
+    if attempt.state == AttemptState::Prepared {
+        // An unauthorized command cannot run, so its lease can be released.
+        db::finalize_attempt(
+            tx,
+            attempt.id,
+            AttemptState::Cancelled,
+            None,
+            None,
+            Some("default yielded before launch"),
+            now,
+        )?;
+        db::release_lease(tx, attempt.id, now)?;
+        db::append_event(
+            tx,
+            Some(job.id),
+            Some(attempt.id),
+            "attempt_cancelled",
+            "daemon",
+            Some("{\"reason\":\"default yielded before launch\"}"),
+        )?;
+        requeue_default(tx, job, now, "default yielded to ordinary work")?;
+    }
+    Ok(vec![PostAction::PublishCancel {
+        attempt_id: attempt.id,
+        token: attempt.launch_token.clone(),
+        force: true,
+        requested_at: now,
+    }])
+}
+
+fn validate_default_submission(tx: &Transaction<'_>, params: &SubmitParams) -> ApiResult<()> {
+    if !params.is_default {
+        return Ok(());
+    }
+    if params.max_parallel_runs != 1 {
+        return Err(ApiError::new(
+            error_codes::INVALID_ARGUMENT,
+            "default jobs must have maxParallelRuns=1",
+        ));
+    }
+    if !params.dependencies.is_empty() {
+        return Err(ApiError::new(
+            error_codes::INVALID_ARGUMENT,
+            "default jobs cannot have prerequisites",
+        ));
+    }
+    if db::default_job(tx)?.is_some() {
+        return Err(ApiError::new(
+            error_codes::INVALID_STATE,
+            "a default job is already configured; cancel it before submitting a replacement",
+        ));
+    }
+    Ok(())
+}
+
 fn cancel_job(
     tx: &Transaction<'_>,
     job: JobId,
@@ -1993,6 +2542,13 @@ fn cancel_job(
                     format!("job {} has no live attempt to cancel", row.id),
                 )
             })?;
+            // User cancellation disables restart after a scheduler yield.
+            if attempt.yield_requested {
+                tx.execute(
+                    "UPDATE attempts SET yield_requested = 0 WHERE id = ?1",
+                    [attempt.id],
+                )?;
+            }
             let requested_at = attempt.cancel_requested_at.unwrap_or(now);
             let publish_force = attempt.cancel_force || force;
             db::set_attempt_cancel_requested(tx, attempt.id, force, now)?;
@@ -2170,10 +2726,17 @@ fn validate_submission_fs(params: &SubmitParams) -> ApiResult<()> {
 /// traversal while still rejecting typos before insertion.
 fn validate_submission_parents(tx: &Transaction<'_>, params: &SubmitParams) -> ApiResult<()> {
     for parent in params.dependencies.iter().map(|dependency| dependency.job) {
-        if parent <= 0 || db::job_row(tx, parent)?.is_none() {
+        let row = db::job_row(tx, parent)?;
+        if parent <= 0 || row.is_none() {
             return Err(ApiError::new(
                 error_codes::NOT_FOUND,
                 format!("dependency parent job {parent} does not exist"),
+            ));
+        }
+        if row.is_some_and(|row| row.is_default) {
+            return Err(ApiError::new(
+                error_codes::INVALID_ARGUMENT,
+                "a recurring default job cannot be a prerequisite",
             ));
         }
     }
@@ -2184,6 +2747,835 @@ fn validate_submission_parents(tx: &Transaction<'_>, params: &SubmitParams) -> A
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    fn policy_paths() -> Paths {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/policy-tests");
+        Paths {
+            runtime_dir: root.join("runtime"),
+            state_dir: root.join("state"),
+            config_file: root.join("config.toml"),
+        }
+    }
+
+    fn policy_op(conn: &mut Connection, op: Op) -> ApiResult<Reply> {
+        let tx = conn.transaction()?;
+        let (reply, _) = apply_mutation(&tx, &policy_paths(), &op, 0)?;
+        tx.commit()?;
+        Ok(reply)
+    }
+
+    fn test_params(name: &str) -> SubmitParams {
+        SubmitParams {
+            name: name.into(),
+            is_default: false,
+            class: None,
+            run_window: None,
+            cwd: env!("CARGO_MANIFEST_DIR").into(),
+            args: vec!["never-executed".into()],
+            env: BTreeMap::new(),
+            max_parallel_runs: 1,
+            priority: 0,
+            max_attempts: 1,
+            retry_delay_ms: 0,
+            time_limit_ms: None,
+            dependencies: Vec::new(),
+        }
+    }
+
+    fn submit_job(conn: &mut Connection, params: SubmitParams) -> JobId {
+        let Reply::Submitted { job } = policy_op(conn, Op::Submit(params)).unwrap() else {
+            panic!("expected submitted")
+        };
+        job.id
+    }
+
+    fn policy_job(conn: &mut Connection, name: &str, parent: Option<JobId>) -> JobId {
+        let params = SubmitParams {
+            class: Some("ablations".into()),
+            max_parallel_runs: 4,
+            dependencies: parent
+                .into_iter()
+                .map(|job| protocol::DependencySpec {
+                    job,
+                    condition: domain::DependencyCondition::Succeeded,
+                })
+                .collect(),
+            ..test_params(name)
+        };
+        submit_job(conn, params)
+    }
+
+    fn idle_params() -> SubmitParams {
+        SubmitParams {
+            is_default: true,
+            ..test_params("idle")
+        }
+    }
+
+    fn idle_job(conn: &mut Connection) -> JobId {
+        submit_job(conn, idle_params())
+    }
+
+    // Simulate runner results in memory without process checks or a daemon loop.
+    fn bookkeeping_coordinator(conn: Connection) -> Coordinator {
+        let (revisions, _) = watch::channel(0);
+        Coordinator {
+            conn,
+            config: Config::default(),
+            paths: policy_paths(),
+            started_at: 0,
+            boot_id: "test-boot".into(),
+            admission_blocked: None,
+            spawned: HashMap::new(),
+            orphan_term_sent: HashSet::new(),
+            revisions,
+            published_revision: 0,
+            published_admission_blocked: false,
+        }
+    }
+
+    #[test]
+    fn default_controls_require_a_saved_default_and_requeue_terminal_or_held_jobs() {
+        let mut conn = db::open_in_memory().unwrap();
+        for op in [Op::DefaultStart, Op::DefaultEnd { force: false }] {
+            assert_eq!(
+                policy_op(&mut conn, op).unwrap_err().code,
+                error_codes::NOT_FOUND
+            );
+        }
+        let job = idle_job(&mut conn);
+        for state in [
+            JobState::Cancelled,
+            JobState::Failed,
+            JobState::Lost,
+            JobState::Succeeded,
+            JobState::Held,
+        ] {
+            db::update_job_state(&conn, job, state, Some("previous outcome"), 10).unwrap();
+            db::set_job_retry_not_before(&conn, job, Some(5000), 10).unwrap();
+            let Reply::Job { job: started } = policy_op(&mut conn, Op::DefaultStart).unwrap()
+            else {
+                panic!("expected job")
+            };
+            assert_eq!(started.id, job);
+            assert_eq!(started.state, "queued");
+            assert!(started.finished_at.is_none());
+            assert!(started.retry_not_before.is_none());
+            assert!(started.state_reason.is_none());
+        }
+        policy_op(&mut conn, Op::DefaultEnd { force: false }).unwrap();
+        policy_op(&mut conn, Op::DefaultEnd { force: true }).unwrap();
+        assert_eq!(
+            db::job_row(&conn, job).unwrap().unwrap().state,
+            JobState::Cancelled
+        );
+
+        // Ordinary retry keeps its existing restriction on cancelled jobs.
+        assert_eq!(
+            policy_op(&mut conn, Op::Retry { job }).unwrap_err().code,
+            error_codes::INVALID_STATE
+        );
+    }
+
+    #[test]
+    fn default_start_cannot_bypass_pending_cancellation_or_recovery() {
+        let mut conn = db::open_in_memory().unwrap();
+        let job = idle_job(&mut conn);
+        let row = db::job_row(&conn, job).unwrap().unwrap();
+        let attempt = db::create_attempt_with_lease(&conn, &row, "idle-run", 1).unwrap();
+        db::set_attempt_authorized(&conn, attempt.id, 2).unwrap();
+        policy_op(&mut conn, Op::DefaultStart).unwrap();
+        assert_eq!(db::job_row(&conn, job).unwrap().unwrap().attempt_count, 1);
+        policy_op(&mut conn, Op::DefaultEnd { force: true }).unwrap();
+        assert_eq!(
+            policy_op(&mut conn, Op::DefaultStart).unwrap_err().code,
+            error_codes::INVALID_STATE
+        );
+        assert_eq!(db::active_leases(&conn).unwrap().len(), 1);
+        let cancel = db::attempt_row(&conn, attempt.id).unwrap().unwrap();
+        assert!(cancel.cancel_requested && cancel.cancel_force);
+        conn.execute(
+            "UPDATE attempts SET cancel_requested=0, state='quarantined' WHERE id=?1",
+            [attempt.id],
+        )
+        .unwrap();
+        db::update_job_state(&conn, job, JobState::NeedsAttention, None, 3).unwrap();
+        assert_eq!(
+            policy_op(&mut conn, Op::DefaultStart).unwrap_err().code,
+            error_codes::INVALID_STATE
+        );
+        assert_eq!(db::active_leases(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn default_controls_select_active_then_latest_and_replay_idempotently() {
+        let mut conn = db::open_in_memory().unwrap();
+        let old = idle_job(&mut conn);
+        policy_op(&mut conn, Op::DefaultEnd { force: false }).unwrap();
+        let latest = idle_job(&mut conn);
+        policy_op(&mut conn, Op::DefaultEnd { force: false }).unwrap();
+        assert_eq!(db::default_for_control(&conn).unwrap().unwrap().id, latest);
+        db::update_job_state(&conn, old, JobState::Queued, None, 1).unwrap();
+        assert_eq!(db::default_for_control(&conn).unwrap().unwrap().id, old);
+        policy_op(&mut conn, Op::DefaultEnd { force: false }).unwrap();
+        let mut coordinator = bookkeeping_coordinator(conn);
+        coordinator
+            .handle_mutation(&Op::Pause, "pause-tests")
+            .unwrap();
+        coordinator
+            .handle_mutation(&Op::DefaultStart, "start-once")
+            .unwrap();
+        let op = Op::DefaultEnd { force: false };
+        coordinator.handle_mutation(&op, "end-once").unwrap();
+        coordinator
+            .handle_mutation(&Op::DefaultStart, "start-again")
+            .unwrap();
+        coordinator.handle_mutation(&op, "end-once").unwrap();
+        assert_eq!(
+            db::job_row(&coordinator.conn, latest)
+                .unwrap()
+                .unwrap()
+                .state,
+            JobState::Queued
+        );
+    }
+
+    #[test]
+    fn default_lookup_keeps_terminal_history_and_prefers_an_active_default() {
+        let mut conn = db::open_in_memory().unwrap();
+        let job = idle_job(&mut conn);
+        policy_op(&mut conn, Op::Cancel { job, force: false }).unwrap();
+        for n in 0..30 {
+            let now = now_ms() + n + 1;
+            let ordinary = db::insert_job(&conn, &test_params("ordinary"), now).unwrap();
+            db::update_job_state(&conn, ordinary, JobState::Succeeded, None, now).unwrap();
+        }
+        assert!(
+            db::status_jobs(&conn, 25)
+                .unwrap()
+                .iter()
+                .all(|row| row.id != job)
+        );
+        let found = db::default_for_command(&conn, "never-executed")
+            .unwrap()
+            .unwrap();
+        assert_eq!((found.id, found.state), (job, JobState::Cancelled));
+        assert!(db::default_for_command(&conn, "missing").unwrap().is_none());
+        let mut other = idle_params();
+        other.args = vec!["other-idle-command".into()];
+        let active = submit_job(&mut conn, other);
+        assert_eq!(
+            db::default_for_command(&conn, "never-executed")
+                .unwrap()
+                .unwrap()
+                .id,
+            active
+        );
+    }
+
+    #[test]
+    fn reboot_recovery_preserves_cancellation_timeouts_and_quarantine() {
+        for (boot, state, cancel, yielded, timeout, expected) in [
+            (
+                Some("old-boot"),
+                AttemptState::Running,
+                false,
+                false,
+                false,
+                Some(JobState::Queued),
+            ),
+            (
+                Some("old-boot"),
+                AttemptState::Authorized,
+                false,
+                false,
+                false,
+                Some(JobState::Queued),
+            ),
+            (
+                Some("old-boot"),
+                AttemptState::Orphaned,
+                false,
+                false,
+                false,
+                Some(JobState::Queued),
+            ),
+            (
+                Some("old-boot"),
+                AttemptState::Running,
+                true,
+                false,
+                false,
+                Some(JobState::Cancelled),
+            ),
+            (
+                Some("old-boot"),
+                AttemptState::Running,
+                true,
+                true,
+                false,
+                Some(JobState::Queued),
+            ),
+            (
+                Some("old-boot"),
+                AttemptState::Running,
+                false,
+                false,
+                true,
+                Some(JobState::Failed),
+            ),
+            (
+                Some("old-boot"),
+                AttemptState::Quarantined,
+                false,
+                false,
+                false,
+                None,
+            ),
+            (
+                Some("test-boot"),
+                AttemptState::Running,
+                false,
+                false,
+                false,
+                None,
+            ),
+            (None, AttemptState::Running, false, false, false, None),
+        ] {
+            let mut conn = db::open_in_memory().unwrap();
+            let job = idle_job(&mut conn);
+            let row = db::job_row(&conn, job).unwrap().unwrap();
+            let attempt = db::create_attempt_with_lease(&conn, &row, "never-launched", 0).unwrap();
+            conn.execute(
+                "UPDATE attempts SET state=?2, runner_boot_id=?3, cancel_requested=?4,
+                 yield_requested=?5, timed_out_at=?6 WHERE id=?1",
+                rusqlite::params![
+                    attempt.id,
+                    state.as_str(),
+                    boot,
+                    cancel,
+                    yielded,
+                    timeout.then_some(1)
+                ],
+            )
+            .unwrap();
+            let attempt = db::attempt_row(&conn, attempt.id).unwrap().unwrap();
+            let mut coordinator = bookkeeping_coordinator(conn);
+            let dir = coordinator.paths.attempt_dir(attempt.id);
+            assert_eq!(
+                coordinator
+                    .recover_rebooted_default(&attempt, &dir)
+                    .unwrap(),
+                expected.is_some()
+            );
+            if let Some(expected) = expected {
+                assert_eq!(
+                    db::job_row(&coordinator.conn, job).unwrap().unwrap().state,
+                    expected
+                );
+                assert!(db::active_leases(&coordinator.conn).unwrap().is_empty());
+            } else {
+                assert_eq!(db::active_leases(&coordinator.conn).unwrap().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn reboot_does_not_revive_held_jobs_or_exhausted_failure_budgets() {
+        let mut conn = db::open_in_memory().unwrap();
+        let job = idle_job(&mut conn);
+        policy_op(&mut conn, Op::Hold { job }).unwrap();
+        let mut coordinator = bookkeeping_coordinator(conn);
+        coordinator.reconcile_all().unwrap();
+        assert_eq!(
+            db::job_row(&coordinator.conn, job).unwrap().unwrap().state,
+            JobState::Held
+        );
+
+        policy_op(&mut coordinator.conn, Op::Release { job }).unwrap();
+        let row = db::job_row(&coordinator.conn, job).unwrap().unwrap();
+        let failed = db::create_attempt_with_lease(&coordinator.conn, &row, "failure", 0).unwrap();
+        db::finalize_attempt(
+            &coordinator.conn,
+            failed.id,
+            AttemptState::Failed,
+            Some(1),
+            None,
+            None,
+            1,
+        )
+        .unwrap();
+        db::release_lease(&coordinator.conn, failed.id, 1).unwrap();
+        let row = db::job_row(&coordinator.conn, job).unwrap().unwrap();
+        let lost = db::create_attempt_with_lease(&coordinator.conn, &row, "reboot", 2).unwrap();
+        coordinator
+            .conn
+            .execute(
+                "UPDATE attempts SET runner_boot_id='old-boot' WHERE id=?1",
+                [lost.id],
+            )
+            .unwrap();
+        let lost = db::attempt_row(&coordinator.conn, lost.id)
+            .unwrap()
+            .unwrap();
+        coordinator
+            .finalize_attempt_and_job(&lost, AttemptState::Lost, None, None, None, "daemon")
+            .unwrap();
+        assert_eq!(
+            db::job_row(&coordinator.conn, job).unwrap().unwrap().state,
+            JobState::Lost
+        );
+    }
+
+    #[test]
+    fn recurring_history_is_paged_and_mutation_acknowledgements_stay_small() {
+        let mut conn = db::open_in_memory().unwrap();
+        let job = idle_job(&mut conn);
+        conn.execute(
+            "WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<6000)
+             INSERT INTO attempts(job_id,number,state,launch_token,max_parallel_runs,created_at)
+             SELECT ?1,x,'succeeded','history-'||x,1,x FROM n",
+            [job],
+        )
+        .unwrap();
+        conn.execute("UPDATE jobs SET attempt_count=6000 WHERE id=?1", [job])
+            .unwrap();
+        let mut coordinator = bookkeeping_coordinator(conn);
+        let shown = coordinator.handle_read(&Op::Show { job }).unwrap();
+        assert!(
+            serde_json::to_vec(&shown).unwrap().len() < protocol::DEFAULT_MAX_FRAME_BYTES as usize
+        );
+        let Reply::Job { job: shown } = shown else {
+            panic!("expected job")
+        };
+        assert_eq!(shown.attempts.len(), views::JOB_ATTEMPT_LIMIT as usize);
+        assert!(shown.attempts_truncated);
+        assert_eq!(shown.attempts.last().unwrap().number, 6000);
+        let Reply::Attempts {
+            attempts,
+            next_before,
+        } = coordinator
+            .handle_read(&Op::Attempts {
+                job,
+                before: None,
+                limit: 100,
+            })
+            .unwrap()
+        else {
+            panic!("expected attempts")
+        };
+        assert_eq!(attempts.len(), 100);
+        assert_eq!(next_before, Some(5901));
+        let Reply::Attempts { attempts, .. } = coordinator
+            .handle_read(&Op::Attempts {
+                job,
+                before: next_before,
+                limit: 100,
+            })
+            .unwrap()
+        else {
+            panic!("expected attempts")
+        };
+        assert_eq!(attempts.first().unwrap().number, 5900);
+        let reply = coordinator
+            .handle_mutation(&Op::Cancel { job, force: false }, "cancel-history")
+            .unwrap();
+        let Reply::Job { job: reply } = reply else {
+            panic!("expected job")
+        };
+        assert!(reply.attempts.is_empty());
+        let (_, stored) = db::lookup_operation(&coordinator.conn, "cancel-history")
+            .unwrap()
+            .unwrap();
+        assert!(stored.len() < protocol::DEFAULT_MAX_FRAME_BYTES as usize);
+        assert!(matches!(
+            serde_json::from_str::<Reply>(&stored).unwrap(),
+            Reply::Job { .. }
+        ));
+        let mut old_reply = reply;
+        old_reply.attempts = vec![shown.attempts[0].clone(); 6000];
+        let encoded = serde_json::to_string(&Reply::Job { job: old_reply }).unwrap();
+        assert!(encoded.len() > protocol::DEFAULT_MAX_FRAME_BYTES as usize);
+        let op = Op::Cancel { job, force: false };
+        db::insert_operation(
+            &coordinator.conn,
+            "old-cancel",
+            op.kind(),
+            &op.request_hash(),
+            &encoded,
+            0,
+        )
+        .unwrap();
+        let Reply::Job { job: replayed } = coordinator.handle_mutation(&op, "old-cancel").unwrap()
+        else {
+            panic!("expected job")
+        };
+        assert!(replayed.attempts.is_empty());
+        let (hash, compact) = db::lookup_operation(&coordinator.conn, "old-cancel")
+            .unwrap()
+            .unwrap();
+        assert_eq!(hash, op.request_hash());
+        assert!(compact.len() < protocol::DEFAULT_MAX_FRAME_BYTES as usize);
+    }
+
+    #[test]
+    fn only_one_default_can_be_enabled_and_it_cannot_share_or_gate_dependencies() {
+        let mut conn = db::open_in_memory().unwrap();
+        let mut invalid = idle_params();
+        invalid.max_parallel_runs = 2;
+        assert_eq!(
+            policy_op(&mut conn, Op::Submit(invalid)).unwrap_err().code,
+            error_codes::INVALID_ARGUMENT
+        );
+        let job = idle_job(&mut conn);
+        assert!(db::job_row(&conn, job).unwrap().unwrap().is_default);
+        assert_eq!(
+            policy_op(&mut conn, Op::Submit(idle_params()))
+                .unwrap_err()
+                .code,
+            error_codes::INVALID_STATE
+        );
+        let mut child = idle_params();
+        child.is_default = false;
+        child.dependencies.push(protocol::DependencySpec {
+            job,
+            condition: domain::DependencyCondition::Terminal,
+        });
+        assert_eq!(
+            policy_op(&mut conn, Op::Submit(child)).unwrap_err().code,
+            error_codes::INVALID_ARGUMENT
+        );
+        assert!(
+            policy_op(
+                &mut conn,
+                Op::SetMaxParallelRuns {
+                    job,
+                    max_parallel_runs: 2
+                }
+            )
+            .is_err()
+        );
+        policy_op(&mut conn, Op::Cancel { job, force: false }).unwrap();
+        assert_ne!(idle_job(&mut conn), job);
+    }
+
+    #[test]
+    fn default_yield_is_durable_and_keeps_the_lease_until_completion() {
+        let mut conn = db::open_in_memory().unwrap();
+        let job = idle_job(&mut conn);
+        let row = db::job_row(&conn, job).unwrap().unwrap();
+        let attempt = db::create_attempt_with_lease(&conn, &row, "not-spawned", 0).unwrap();
+        db::set_attempt_state(&conn, attempt.id, AttemptState::Authorized, None).unwrap();
+        let attempt = db::attempt_row(&conn, attempt.id).unwrap().unwrap();
+        let tx = conn.transaction().unwrap();
+        let actions = request_default_yield(&tx, &row, &attempt, 10).unwrap();
+        assert_eq!(actions.len(), 1);
+        tx.commit().unwrap();
+        let committed = db::attempt_row(&conn, attempt.id).unwrap().unwrap();
+        assert!(committed.yield_requested && committed.cancel_requested && committed.cancel_force);
+        assert_eq!(db::active_leases(&conn).unwrap().len(), 1);
+        // Simulate restart by constructing bookkeeping from persisted rows.
+        let mut coordinator = bookkeeping_coordinator(conn);
+        coordinator
+            .finalize_attempt_and_job(
+                &committed,
+                AttemptState::Cancelled,
+                None,
+                Some(libc::SIGTERM),
+                Some("yielded"),
+                "runner",
+            )
+            .unwrap();
+        assert_eq!(
+            db::job_row(&coordinator.conn, job).unwrap().unwrap().state,
+            JobState::Queued
+        );
+        assert!(db::active_leases(&coordinator.conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn operator_cancel_overrides_default_restart_and_prepared_yield_is_safe() {
+        let mut conn = db::open_in_memory().unwrap();
+        let job = idle_job(&mut conn);
+        let row = db::job_row(&conn, job).unwrap().unwrap();
+        let prepared = db::create_attempt_with_lease(&conn, &row, "never-authorized", 0).unwrap();
+        let tx = conn.transaction().unwrap();
+        request_default_yield(&tx, &row, &prepared, 10).unwrap();
+        tx.commit().unwrap();
+        assert!(db::active_leases(&conn).unwrap().is_empty());
+        assert_eq!(
+            db::job_row(&conn, job).unwrap().unwrap().state,
+            JobState::Queued
+        );
+        let row = db::job_row(&conn, job).unwrap().unwrap();
+        let attempt = db::create_attempt_with_lease(&conn, &row, "next-run", 2_000).unwrap();
+        db::set_attempt_state(&conn, attempt.id, AttemptState::Authorized, None).unwrap();
+        let attempt = db::attempt_row(&conn, attempt.id).unwrap().unwrap();
+        let tx = conn.transaction().unwrap();
+        request_default_yield(&tx, &row, &attempt, 2_010).unwrap();
+        tx.commit().unwrap();
+        policy_op(&mut conn, Op::Cancel { job, force: true }).unwrap();
+        let committed = db::attempt_row(&conn, attempt.id).unwrap().unwrap();
+        assert!(!committed.yield_requested);
+        let mut coordinator = bookkeeping_coordinator(conn);
+        coordinator
+            .finalize_attempt_and_job(
+                &committed,
+                AttemptState::Cancelled,
+                None,
+                Some(libc::SIGTERM),
+                None,
+                "runner",
+            )
+            .unwrap();
+        assert_eq!(
+            db::job_row(&coordinator.conn, job).unwrap().unwrap().state,
+            JobState::Cancelled
+        );
+    }
+
+    #[test]
+    fn successful_default_repeats_but_failed_default_obeys_its_retry_budget() {
+        let mut conn = db::open_in_memory().unwrap();
+        let job = idle_job(&mut conn);
+        let row = db::job_row(&conn, job).unwrap().unwrap();
+        let attempt = db::create_attempt_with_lease(&conn, &row, "success", 0).unwrap();
+        let mut coordinator = bookkeeping_coordinator(conn);
+        coordinator
+            .finalize_attempt_and_job(
+                &attempt,
+                AttemptState::Succeeded,
+                Some(0),
+                None,
+                None,
+                "runner",
+            )
+            .unwrap();
+        let row = db::job_row(&coordinator.conn, job).unwrap().unwrap();
+        assert_eq!(row.state, JobState::Queued);
+        assert!(row.retry_not_before.is_some());
+        let failed =
+            db::create_attempt_with_lease(&coordinator.conn, &row, "failure", 2_000).unwrap();
+        coordinator
+            .finalize_attempt_and_job(&failed, AttemptState::Failed, Some(1), None, None, "runner")
+            .unwrap();
+        assert_eq!(
+            db::job_row(&coordinator.conn, job).unwrap().unwrap().state,
+            JobState::Failed
+        );
+    }
+
+    #[test]
+    fn class_pause_and_membership_changes_are_scoped() {
+        let mut conn = db::open_in_memory().unwrap();
+        policy_op(
+            &mut conn,
+            Op::ClassCreate {
+                name: "ablations".into(),
+                run_window: None,
+            },
+        )
+        .unwrap();
+        let a = policy_job(&mut conn, "a", None);
+        let b = policy_job(&mut conn, "b", None);
+        policy_op(
+            &mut conn,
+            Op::SetClass {
+                job: b,
+                class: None,
+            },
+        )
+        .unwrap();
+        policy_op(
+            &mut conn,
+            Op::ClassPause {
+                name: "ablations".into(),
+                paused: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db::eligible_candidates(&conn, 0)
+                .unwrap()
+                .iter()
+                .map(|c| c.job_id)
+                .collect::<Vec<_>>(),
+            vec![b]
+        );
+        policy_op(
+            &mut conn,
+            Op::ClassPause {
+                name: "ablations".into(),
+                paused: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(db::eligible_candidates(&conn, 0).unwrap().len(), 2);
+        let err = policy_op(
+            &mut conn,
+            Op::SetClass {
+                job: a,
+                class: Some("missing".into()),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, error_codes::NOT_FOUND);
+        assert_eq!(
+            db::job_row(&conn, a).unwrap().unwrap().class.as_deref(),
+            Some("ablations")
+        );
+        assert!(
+            policy_op(
+                &mut conn,
+                Op::ClassCreate {
+                    name: "bad name".into(),
+                    run_window: None
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn group_cancel_handles_dependency_cascades_and_leaves_other_jobs() {
+        let mut conn = db::open_in_memory().unwrap();
+        policy_op(
+            &mut conn,
+            Op::ClassCreate {
+                name: "ablations".into(),
+                run_window: None,
+            },
+        )
+        .unwrap();
+        let parent = policy_job(&mut conn, "parent", None);
+        let child = policy_job(&mut conn, "child", Some(parent));
+        let other = policy_job(&mut conn, "other", None);
+        policy_op(
+            &mut conn,
+            Op::SetClass {
+                job: other,
+                class: None,
+            },
+        )
+        .unwrap();
+        policy_op(
+            &mut conn,
+            Op::ClassCancel {
+                name: "ablations".into(),
+                force: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db::job_row(&conn, parent).unwrap().unwrap().state,
+            JobState::Cancelled
+        );
+        assert_eq!(
+            db::job_row(&conn, child).unwrap().unwrap().state,
+            JobState::Skipped
+        );
+        assert_eq!(
+            db::job_row(&conn, other).unwrap().unwrap().state,
+            JobState::Queued
+        );
+        // Repeating a class cancellation with only terminal members succeeds.
+        policy_op(
+            &mut conn,
+            Op::ClassCancel {
+                name: "ablations".into(),
+                force: false,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn live_class_windows_cannot_be_rewritten_but_pauses_are_allowed() {
+        let mut conn = db::open_in_memory().unwrap();
+        policy_op(
+            &mut conn,
+            Op::ClassCreate {
+                name: "ablations".into(),
+                run_window: None,
+            },
+        )
+        .unwrap();
+        let job = policy_job(&mut conn, "a", None);
+        let row = db::job_row(&conn, job).unwrap().unwrap();
+        let attempt = db::create_attempt_with_lease(&conn, &row, "not-spawned", 0).unwrap();
+        let window = Some("23:00-07:00".parse().unwrap());
+        let err = policy_op(
+            &mut conn,
+            Op::ClassSetWindow {
+                name: "ablations".into(),
+                run_window: window.clone(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, error_codes::INVALID_STATE);
+        assert!(
+            policy_op(
+                &mut conn,
+                Op::SetRunWindow {
+                    job,
+                    run_window: window
+                }
+            )
+            .is_err()
+        );
+        assert!(policy_op(&mut conn, Op::SetClass { job, class: None }).is_err());
+        policy_op(
+            &mut conn,
+            Op::ClassPause {
+                name: "ablations".into(),
+                paused: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            db::attempt_row(&conn, attempt.id).unwrap().unwrap().state,
+            AttemptState::Prepared
+        );
+        assert_eq!(db::active_leases(&conn).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unsafe_class_cancel_rolls_back_all_members() {
+        let mut conn = db::open_in_memory().unwrap();
+        policy_op(
+            &mut conn,
+            Op::ClassCreate {
+                name: "ablations".into(),
+                run_window: None,
+            },
+        )
+        .unwrap();
+        let queued = policy_job(&mut conn, "queued", None);
+        let unsafe_job = policy_job(&mut conn, "quarantined", None);
+        let row = db::job_row(&conn, unsafe_job).unwrap().unwrap();
+        let attempt = db::create_attempt_with_lease(&conn, &row, "not-spawned", 0).unwrap();
+        db::set_attempt_state(&conn, attempt.id, AttemptState::Quarantined, None).unwrap();
+        db::update_job_state(&conn, unsafe_job, JobState::NeedsAttention, None, 0).unwrap();
+        let err = policy_op(
+            &mut conn,
+            Op::ClassCancel {
+                name: "ablations".into(),
+                force: true,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(err.code, error_codes::UNSAFE_RESOLUTION);
+        assert_eq!(
+            db::job_row(&conn, queued).unwrap().unwrap().state,
+            JobState::Queued
+        );
+        assert!(
+            !db::attempt_row(&conn, attempt.id)
+                .unwrap()
+                .unwrap()
+                .cancel_requested
+        );
+    }
 
     fn command(limit: Option<u64>) -> CommandFile {
         CommandFile {
@@ -2197,6 +3589,7 @@ mod tests {
             cancel_grace_ms: 1,
             poll_ms: 10,
             time_limit_ms: limit,
+            window_end_at: None,
         }
     }
 
@@ -2280,6 +3673,9 @@ mod tests {
         let conn = db::open_in_memory().unwrap();
         let params = SubmitParams {
             name: "subscribed".into(),
+            is_default: false,
+            class: None,
+            run_window: None,
             cwd: "/tmp".into(),
             args: vec!["true".into()],
             env: BTreeMap::new(),

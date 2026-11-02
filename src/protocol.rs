@@ -10,12 +10,17 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::domain::{AttemptId, DependencyCondition, DependencyResolution, JobId};
+use crate::run_window::RunWindow;
 
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 pub const DEFAULT_MAX_FRAME_BYTES: u32 = 1 << 20;
 
 fn is_zero(value: &i64) -> bool {
     *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 // Stable error codes.
@@ -48,7 +53,47 @@ pub struct Request {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Op {
     Submit(SubmitParams),
+    Classes,
+    ClassShow {
+        name: String,
+    },
+    ClassCreate {
+        name: String,
+        run_window: Option<RunWindow>,
+    },
+    ClassPause {
+        name: String,
+        paused: bool,
+    },
+    ClassSetWindow {
+        name: String,
+        run_window: Option<RunWindow>,
+    },
+    ClassCancel {
+        name: String,
+        force: bool,
+    },
+    SetClass {
+        job: JobId,
+        class: Option<String>,
+    },
+    SetRunWindow {
+        job: JobId,
+        run_window: Option<RunWindow>,
+    },
     Status,
+    DefaultJob {
+        command: String,
+    },
+    DefaultEnd {
+        force: bool,
+    },
+    DefaultStart,
+    Attempts {
+        job: JobId,
+        before: Option<i64>,
+        limit: u32,
+    },
     /// Turns the connection into a stream of `Status` snapshots (see
     /// ARCHITECTURE.md); the reply payload is identical to `Status`.
     Subscribe,
@@ -119,6 +164,14 @@ impl Op {
         matches!(
             self,
             Op::Submit(_)
+                | Op::ClassCreate { .. }
+                | Op::ClassPause { .. }
+                | Op::ClassSetWindow { .. }
+                | Op::ClassCancel { .. }
+                | Op::SetClass { .. }
+                | Op::SetRunWindow { .. }
+                | Op::DefaultEnd { .. }
+                | Op::DefaultStart
                 | Op::Cancel { .. }
                 | Op::Hold { .. }
                 | Op::Release { .. }
@@ -135,7 +188,19 @@ impl Op {
     pub fn kind(&self) -> &'static str {
         match self {
             Op::Submit(_) => "submit",
+            Op::Classes => "classes",
+            Op::ClassShow { .. } => "class_show",
+            Op::ClassCreate { .. } => "class_create",
+            Op::ClassPause { .. } => "class_pause",
+            Op::ClassSetWindow { .. } => "class_set_window",
+            Op::ClassCancel { .. } => "class_cancel",
+            Op::SetClass { .. } => "set_class",
+            Op::SetRunWindow { .. } => "set_run_window",
             Op::Status => "status",
+            Op::DefaultJob { .. } => "default_job",
+            Op::DefaultEnd { .. } => "default_end",
+            Op::DefaultStart => "default_start",
+            Op::Attempts { .. } => "attempts",
             Op::Subscribe => "subscribe",
             Op::SubscribeJob { .. } => "subscribe_job",
             Op::FollowTtsSnapshot => "follow_tts_snapshot",
@@ -196,7 +261,11 @@ impl Op {
         let Self::Submit(params) = self else {
             return None;
         };
-        if params.time_limit_ms.is_some() {
+        if params.time_limit_ms.is_some()
+            || params.class.is_some()
+            || params.run_window.is_some()
+            || params.is_default
+        {
             return None;
         }
         let after_success: Vec<_> = params
@@ -254,6 +323,12 @@ struct LegacyV5SubmitParams<'a> {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SubmitParams {
     pub name: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_default: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_window: Option<RunWindow>,
     pub cwd: String,
     /// Exact argument vector; argv[0] is the executable.
     pub args: Vec<String>,
@@ -306,16 +381,52 @@ pub struct ErrorBody {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Reply {
-    Submitted { job: JobView },
-    Job { job: JobView },
+    Classes {
+        classes: Vec<ClassView>,
+    },
+    Class {
+        class: ClassView,
+    },
+    ClassJobs {
+        class: ClassView,
+        jobs: Vec<JobView>,
+    },
+    Submitted {
+        job: JobView,
+    },
+    Job {
+        job: JobView,
+    },
     Status(StatusView),
+    DefaultJob {
+        job: Option<JobView>,
+    },
+    Attempts {
+        attempts: Vec<AttemptView>,
+        next_before: Option<i64>,
+    },
     FollowTtsSnapshot(FollowTtsSnapshotView),
     JobUpdate(JobUpdateView),
-    Events { events: Vec<EventView> },
+    Events {
+        events: Vec<EventView>,
+    },
     LogPaths(LogPathsView),
     DaemonStatus(DaemonStatusView),
-    RecoverList { attempts: Vec<AttemptView> },
-    Paused { paused: bool },
+    RecoverList {
+        attempts: Vec<AttemptView>,
+    },
+    Paused {
+        paused: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClassView {
+    pub name: String,
+    pub paused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_window: Option<RunWindow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,6 +434,14 @@ pub enum Reply {
 pub struct JobView {
     pub id: JobId,
     pub name: String,
+    #[serde(default)]
+    pub is_default: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_window: Option<RunWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class_run_window: Option<RunWindow>,
     pub state: String,
     /// Why a non-terminal job is not running right now (derived, not stored).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -354,6 +473,8 @@ pub struct JobView {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dependencies: Vec<DependencyView>,
     pub attempts: Vec<AttemptView>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub attempts_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cancel_requested: Option<bool>,
 }
@@ -417,6 +538,8 @@ pub struct AttemptView {
     pub number: i64,
     pub state: String,
     pub max_parallel_runs: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_end_at: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -605,10 +728,53 @@ mod tests {
     use super::*;
 
     #[test]
+    fn class_operations_require_idempotency_and_windows_are_validated() {
+        let create: Op = serde_json::from_str(
+            r#"{"type":"class_create","name":"night","run_window":"23:00-07:00@-04:00"}"#,
+        )
+        .unwrap();
+        assert!(create.is_mutation());
+        assert_eq!(create.kind(), "class_create");
+        assert!(!Op::Classes.is_mutation());
+        assert!(
+            !Op::ClassShow {
+                name: "night".into()
+            }
+            .is_mutation()
+        );
+        assert!(
+            serde_json::from_str::<Op>(
+                r#"{"type":"set_run_window","job":1,"run_window":"25:00-07:00"}"#
+            )
+            .is_err()
+        );
+        let alias: Op = serde_json::from_str(
+            r#"{"type":"set_run_window","job":1,"run_window":"23:00-07:00@Z"}"#,
+        )
+        .unwrap();
+        let canonical = Op::SetRunWindow {
+            job: 1,
+            run_window: Some("23:00-07:00@+00:00".parse().unwrap()),
+        };
+        assert_eq!(alias.request_hash(), canonical.request_hash());
+        assert_ne!(
+            alias.request_hash(),
+            Op::SetRunWindow {
+                job: 1,
+                run_window: None
+            }
+            .request_hash()
+        );
+    }
+
+    #[test]
     fn request_hash_is_stable_and_payload_sensitive() {
         let mk = |limit, priority| {
             Op::Submit(SubmitParams {
                 name: "x".into(),
+                is_default: false,
+                class: None,
+                run_window: None,
                 cwd: "/tmp".into(),
                 args: vec!["true".into()],
                 env: BTreeMap::new(),
@@ -623,6 +789,38 @@ mod tests {
         assert_eq!(mk(1, 0).request_hash(), mk(1, 0).request_hash());
         assert_ne!(mk(1, 0).request_hash(), mk(2, 0).request_hash());
         assert_ne!(mk(1, 0).request_hash(), mk(1, -1).request_hash());
+        let Op::Submit(mut idle) = mk(1, 0) else {
+            unreachable!()
+        };
+        idle.is_default = true;
+        assert_ne!(
+            Op::Submit(idle.clone()).request_hash(),
+            mk(1, 0).request_hash()
+        );
+        assert!(Op::Submit(idle).legacy_v5_request_hash().is_none());
+        let Op::Submit(mut classified) = mk(1, 0) else {
+            unreachable!()
+        };
+        classified.class = Some("night".into());
+        assert_ne!(
+            Op::Submit(classified.clone()).request_hash(),
+            mk(1, 0).request_hash()
+        );
+        assert!(
+            Op::Submit(classified.clone())
+                .legacy_v5_request_hash()
+                .is_none()
+        );
+        classified.run_window = Some("23:00-07:00".parse().unwrap());
+        assert_ne!(
+            Op::Submit(classified.clone()).request_hash(),
+            Op::Submit({
+                let mut p = classified;
+                p.run_window = None;
+                p
+            })
+            .request_hash()
+        );
 
         let mut dependency_order_a = match mk(1, 0) {
             Op::Submit(params) => params,
@@ -731,8 +929,8 @@ mod tests {
     #[test]
     fn subscribe_is_a_read_op_on_the_current_protocol_version() {
         // The exact bytes a streaming consumer sends; `subscribe` is additive,
-        // so the version stays 8.
-        let wire = r#"{"protocol_version":8,"request_id":"r1","op":{"type":"subscribe"}}"#;
+        // and uses the current protocol version.
+        let wire = r#"{"protocol_version":9,"request_id":"r1","op":{"type":"subscribe"}}"#;
         let request: Request = serde_json::from_str(wire).unwrap();
         assert_eq!(request.protocol_version, PROTOCOL_VERSION);
         assert!(matches!(request.op, Op::Subscribe));
@@ -788,7 +986,7 @@ mod tests {
             serde_json::to_string(&clear).unwrap(),
             r#"{"type":"set_time_limit","job":3,"time_limit_ms":null}"#
         );
-        let wire = r#"{"protocol_version":8,"request_id":"r1","idempotency_key":"k","op":{"type":"set_time_limit","job":3,"time_limit_ms":1500}}"#;
+        let wire = r#"{"protocol_version":9,"request_id":"r1","idempotency_key":"k","op":{"type":"set_time_limit","job":3,"time_limit_ms":1500}}"#;
         let request: Request = serde_json::from_str(wire).unwrap();
         assert!(matches!(
             request.op,
@@ -801,7 +999,7 @@ mod tests {
 
     #[test]
     fn see_is_a_read_op_with_optional_job() {
-        let wire = r#"{"protocol_version":8,"request_id":"r1","op":{"type":"see"}}"#;
+        let wire = r#"{"protocol_version":9,"request_id":"r1","op":{"type":"see"}}"#;
         let request: Request = serde_json::from_str(wire).unwrap();
         assert_eq!(request.protocol_version, PROTOCOL_VERSION);
         assert!(matches!(request.op, Op::See { job: None }));
@@ -879,6 +1077,7 @@ mod tests {
             number: 1,
             state: "running".into(),
             max_parallel_runs: 3,
+            window_end_at: None,
             exit_code: None,
             term_signal: None,
             message: None,

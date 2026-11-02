@@ -20,7 +20,8 @@ pub struct ActiveLease {
 }
 
 /// A job eligible to start: prerequisites satisfied, queued, not held, and
-/// retry delay elapsed. Must be supplied in priority/readiness-FIFO order.
+/// retry delay elapsed, class not paused, and all daily run windows open.
+/// Must be supplied in priority/readiness-FIFO order.
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub job_id: JobId,
@@ -28,6 +29,7 @@ pub struct Candidate {
     pub limit: u32,
     /// Higher values rank first. Readiness sequence is the FIFO tiebreaker.
     pub priority: i64,
+    pub is_default: bool,
 }
 
 /// The persisted protected-job reservation, if one is active.
@@ -99,6 +101,35 @@ pub fn can_admit(active_limits: &[u32], candidate_limit: u32) -> bool {
 /// coordinator freezes the cutoff on the pass where those blockers stop
 /// advancing. Lower-priority jobs never backfill past a protected job.
 pub fn plan_pass(
+    active: &[ActiveLease],
+    eligible: &[Candidate],
+    reservation: Option<&ReservationSnapshot>,
+) -> PassOutcome {
+    // The default follows all ordinary candidates, regardless of priority.
+    let ordinary_end = eligible
+        .iter()
+        .position(|candidate| candidate.is_default)
+        .unwrap_or(eligible.len());
+    debug_assert!(
+        eligible[ordinary_end..]
+            .iter()
+            .all(|candidate| candidate.is_default)
+    );
+    debug_assert!(eligible.len() - ordinary_end <= 1);
+    let mut outcome = plan_regular_pass(active, &eligible[..ordinary_end], reservation);
+    if active.is_empty()
+        && ordinary_end == 0
+        && let Some(default) = eligible.first()
+    {
+        outcome.starts.push(Start {
+            job_id: default.job_id,
+            bypasses: None,
+        });
+    }
+    outcome
+}
+
+fn plan_regular_pass(
     active: &[ActiveLease],
     eligible: &[Candidate],
     reservation: Option<&ReservationSnapshot>,
@@ -275,6 +306,7 @@ mod tests {
             ready_seq: job_id,
             limit,
             priority: 0,
+            is_default: false,
         }
     }
 
@@ -284,6 +316,7 @@ mod tests {
             ready_seq: job_id,
             limit,
             priority,
+            is_default: false,
         }
     }
 
@@ -311,6 +344,42 @@ mod tests {
     fn empty_queue_does_nothing() {
         let outcome = plan_pass(&leases(&[3]), &[], None);
         assert_eq!(outcome, PassOutcome::default());
+    }
+
+    #[test]
+    fn default_starts_only_when_idle_and_never_reserves_or_backfills() {
+        let mut idle = prioritized(99, 1, i64::MAX);
+        idle.is_default = true;
+        let plan = plan_pass(&[], &[idle.clone()], None);
+        assert_eq!(start_ids(&plan), vec![99]);
+        assert!(plan.create_reservation.is_none());
+        assert!(plan.starts[0].bypasses.is_none());
+        let busy = plan_pass(&leases(&[4]), &[idle.clone()], None);
+        assert!(busy.starts.is_empty());
+        assert!(busy.create_reservation.is_none());
+        // Even the lowest ordinary priority wins over the highest default.
+        let ordinary = prioritized(1, 4, i64::MIN);
+        let ready = plan_pass(&[], &[ordinary, idle.clone()], None);
+        assert_eq!(start_ids(&ready), vec![1]);
+        // A default is not spare-capacity backfill for an exclusive head.
+        let blocked = plan_pass(&leases(&[4]), &[cand(1, 1), idle], None);
+        assert!(blocked.starts.is_empty());
+        assert_eq!(blocked.create_reservation.unwrap().job_id, 1);
+    }
+
+    #[test]
+    fn default_clears_obsolete_protection_and_waits_when_absent() {
+        let reservation = ReservationSnapshot {
+            job_id: 1,
+            cutoff_seq: None,
+            consumed: BTreeSet::new(),
+        };
+        let mut idle = cand(2, 1);
+        idle.is_default = true;
+        let ready = plan_pass(&[], &[idle], Some(&reservation));
+        assert_eq!(start_ids(&ready), vec![2]);
+        assert!(ready.invalidate_reservation.is_some());
+        assert!(plan_pass(&[], &[], None).starts.is_empty());
     }
 
     #[test]
@@ -521,18 +590,21 @@ mod tests {
                 ready_seq: 1,
                 limit: 1,
                 priority: 0,
+                is_default: false,
             },
             Candidate {
                 job_id: 200,
                 ready_seq: 5,
                 limit: 3,
                 priority: 0,
+                is_default: false,
             },
             Candidate {
                 job_id: 1,
                 ready_seq: 11,
                 limit: 3,
                 priority: 0,
+                is_default: false,
             },
         ];
         let reservation = ReservationSnapshot {
@@ -652,6 +724,7 @@ mod tests {
                                 ready_seq: next_seq,
                                 limit,
                                 priority,
+                                is_default: false,
                             });
                         }
                     }

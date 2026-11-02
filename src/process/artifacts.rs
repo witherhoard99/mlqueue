@@ -49,6 +49,9 @@ pub struct CommandFile {
     /// absent on artifacts created before wall-clock limits were supported.
     #[serde(default)]
     pub time_limit_ms: Option<u64>,
+    /// Window deadline fixed at admission.
+    #[serde(default)]
+    pub window_end_at: Option<i64>,
 }
 
 /// Upgradable wall-clock limit for an attempt that is already supervised.
@@ -123,6 +126,8 @@ pub enum ResultOutcome {
     Cancelled,
     /// The per-attempt wall-clock limit expired.
     TimedOut,
+    /// The job or class daily execution window closed.
+    WindowClosed,
     /// The runner gave up waiting for launch authorization.
     AuthorizationTimeout,
 }

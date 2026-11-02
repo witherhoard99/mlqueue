@@ -99,6 +99,149 @@ mlq pause                 # no new starts; queued work waits; running work conti
 mlq unpause               # resume admission
 ```
 
+## Submitting from different repositories
+
+Each Linux user has a shared queue. Run `mlq` from any repository and set
+`--cwd` to the workload's directory when needed. Use the same CLI and daemon
+socket across projects; different `MLQUEUE_RUNTIME_DIR` values select different
+sockets.
+
+Submit the foreground workload. A queue script that submits and waits for
+other jobs can block those jobs if it holds a lease itself. The CLI captures
+`PATH`, including an activated virtual environment. Pass other needed variables
+with `--env` or `--inherit-env`, or use an absolute interpreter path.
+
+Default locations:
+
+| Data | Default location |
+|---|---|
+| Daemon configuration | `$HOME/.config/mlqueue/config.toml` |
+| Jobs, classes, events, and default job | `$HOME/.local/state/mlqueue/mlqueue.db` |
+| Attempt logs and control records | `$HOME/.local/state/mlqueue/attempts/<attempt-id>/` |
+| Daemon socket | `$XDG_RUNTIME_DIR/mlqueue/mlqd.sock`, or the state directory's `runtime/mlqd.sock` when `XDG_RUNTIME_DIR` is unset |
+
+`XDG_CONFIG_HOME` and `XDG_STATE_HOME` replace the home defaults.
+`MLQUEUE_CONFIG_FILE`, `MLQUEUE_STATE_DIR`, and `MLQUEUE_RUNTIME_DIR` override
+paths directly. Use consistent overrides for the CLI and daemon.
+`mlq daemon status --json` reports the database and socket paths.
+Checkpoints and experiment outputs stay where the workload writes them,
+often relative to `--cwd`.
+
+## Default job for idle periods
+
+Submit one recurring command as the default job:
+
+```bash
+mlq submit --default --name idle-work --cwd /absolute/project \
+  -- /absolute/project/.venv/bin/python idle_work.py
+```
+
+The default runs alone while no ordinary job is eligible. Held jobs, unresolved
+dependencies, retry delays, and closed windows leave room for idle work. The
+default also obeys class pauses and run windows. It requires
+`--max-parallel-runs 1`; ordinary jobs always take precedence over its priority.
+
+When ordinary work becomes ready, the runner stops the default with SIGTERM
+and, if needed, SIGKILL after the configured grace period. Ordinary jobs wait
+until its process group exits. The request survives daemon restarts and appears
+in the event log as `default_yield_requested`.
+
+After yielding or succeeding, the default requeues. Each attempt restarts the
+command and has separate logs; the workload must checkpoint to resume useful
+work. Restarts wait at least one second, or longer if `--retry-delay` says so.
+Failures, including time-limit and window expiry, use `--max-attempts`, counted
+since the last success or yield. The default budget of one stops a failing job.
+
+An active default interrupted by reboot restarts after the daemon proves its
+stored boot ID differs from the current boot. Explicit cancellations, holds,
+quarantine, and exhausted failure budgets stay in effect. A timeout committed
+before reboot still counts as a failure.
+
+Stop the default and restart its saved command later:
+
+```bash
+mlq default end
+mlq default start
+```
+
+`end` cancels the current attempt and disables recurrence. Wait for it to finish
+stopping before using `start`. Add `--force` to escalate to SIGKILL after the
+cancellation grace period. `start` requeues the saved default with its original
+arguments and settings, while keeping its attempt history. It uses the active
+default, or the most recently submitted default when none is active. Ordinary
+jobs still take precedence.
+
+`mlq cancel JOB --force` also disables the default, even during a pending yield.
+Cancel it before submitting a replacement or activating a staged daemon update,
+since it counts as unfinished work. A queued default supports hold/release.
+The default cannot depend on other jobs or serve as a prerequisite. `show` and
+JSON status expose `isDefault`; human status labels the default.
+
+## Job classes and daily run windows
+
+Group ablations in a class with a daily window. This example runs from
+11 PM to 7 AM at a fixed UTC offset of minus four hours:
+
+```bash
+mlq class create ablations --run-window '23:00-07:00@-04:00'
+mlq submit --class ablations --name baseline --max-parallel-runs 4 -- python train.py --variant baseline
+mlq submit --class ablations --name no-dropout --max-parallel-runs 4 -- python train.py --variant no-dropout
+mlq class show ablations
+mlq class list --json
+```
+
+A job can join one existing class. Classes keep the global `maxParallelRuns`
+rule and leave GPU placement to the submitter. Here, each job declares that
+sharing with up to four managed jobs is safe.
+
+Use `submit --run-window '23:00-07:00@-04:00'` for an individual job.
+Both the job and class windows must be open. Otherwise, the job stays queued
+and `status` or `show` explains the wait. Other eligible jobs can run. Waiting
+for a window preserves readiness order; priority and concurrency still apply.
+
+Windows repeat daily and can cross midnight. They include the start and exclude
+the end. Use `HH:MM-HH:MM@+HH:MM` or `HH:MM-HH:MM@-HH:MM`. No offset, or `@Z`,
+means UTC. Offsets do not follow daylight saving time. Equal endpoints are
+invalid; clear a window to allow any time.
+
+Each attempt stores its closing time. The runner refuses late launches and
+sends SIGTERM at close, followed by SIGKILL after `cancel_grace_ms` if needed.
+Shutdown can extend past the window by the grace period and polling delay.
+`runner.log` records closure and signals; `result.json` reports `window_closed`
+after the process group exits.
+
+Window closure fails the attempt. Retries follow `--max-attempts` and
+`--retry-delay`, wait for an open window, and restart the command. The workload
+must checkpoint to resume training. With one attempt, an interrupted job fails
+without running again the next night.
+
+The deadline survives daemon restarts and live `--time-limit` changes. An
+earlier cancellation keeps its outcome and suppresses retries.
+
+```bash
+# Pause or resume new starts. Running attempts continue.
+mlq class pause ablations
+mlq class unpause ablations
+
+# Cancel all unfinished members. --force adds SIGKILL after the grace period.
+mlq class cancel ablations --force
+
+# Change queued or held jobs.
+mlq set-class 42 ablations
+mlq set-class 42 --clear
+mlq set-run-window 42 '23:00-07:00@-04:00'
+mlq set-run-window 42 --clear
+
+# Change the shared window once the class has no live attempts.
+mlq class set-run-window ablations '22:00-06:00@-04:00'
+mlq class set-run-window ablations --clear
+```
+
+Class cancellation either commits for all members or fails before sending
+signals. A quarantined member rejects the whole request. Cancelling a parent
+can leave dependent jobs `skipped`; finished jobs stay in history. Class
+commands support `--json` and mutation idempotency keys.
+
 ## Admission model
 
 Every job declares one concurrency number, `--max-parallel-runs N` (default
@@ -127,8 +270,9 @@ workload is safe next to *arbitrary* other managed jobs, not only next to
 copies of itself.
 
 The queue does **not** discover GPUs, meter VRAM/CPU, infer job types, or
-preempt healthy work. Cooperation is the contract: submit through `mlq`, and
-keep the command (and descendants) foregrounded in the runner’s process group
+preempt ordinary work. Only an explicit default job yields to other jobs.
+Submit through `mlq`, and keep the command (and descendants) foregrounded in
+the runner's process group
 (no `setsid` / daemonizing).
 
 ### Protection and backfill
@@ -144,7 +288,7 @@ indefinitely.
 Each job has a signed `--priority P` (default **0**). Eligible jobs are ordered
 by **higher priority first**, then FIFO within the same priority.
 
-- Priority never preempts a job that already holds a run lease.
+- Priority never preempts an ordinary job that holds a run lease.
 - A protected job only allows equal-priority backfill.
 - A newly eligible higher-priority job can replace a lower-priority
   reservation.
@@ -152,8 +296,8 @@ by **higher priority first**, then FIFO within the same priority.
   nonzero values deliberately.
 
 ```bash
-mlq submit --priority 1  --max-parallel-runs 1 -- COMMAND...   # ahead of default
-mlq submit --priority -1 --max-parallel-runs 3 -- COMMAND...   # yields to default
+mlq submit --priority 1  --max-parallel-runs 1 -- COMMAND...   # ahead of priority 0
+mlq submit --priority -1 --max-parallel-runs 3 -- COMMAND...   # behind priority 0
 mlq set-priority 12 2     # retune queued or held job only
 ```
 
@@ -165,7 +309,10 @@ mlq set-priority 12 2     # retune queued or held job only
 | `status` | Live queue (leases, protection, reasons) |
 | `status -f` | Most recent finished runs only |
 | `subscribe` | Stream queue snapshots as NDJSON (no polling) |
-| `show JOB` | Full job detail and attempts |
+| `default --command PATH` | Active default or the command's latest default, including older history |
+| `default end` / `default start` | Stop the default or restart its saved command |
+| `show JOB` | Job detail and the latest 25 attempts |
+| `attempts JOB` | Attempt history, newest first; page with `--before NUMBER --limit N` |
 | `see [JOB]` | Job detail and latest stdout; latest job if omitted |
 | `logs JOB` | Stdout/stderr; `--follow` exits with attempt outcome |
 | `follow JOB` | Subscribe; final outcome only by default, opt-in events/checks/hooks |
@@ -176,6 +323,9 @@ mlq set-priority 12 2     # retune queued or held job only
 | `set-max-parallel-runs JOB N` | Change limit on queued **or live** jobs |
 | `set-priority JOB P` | Change priority on **queued/held** jobs only |
 | `set-time-limit JOB DURATION` | Change (`--clear` removes) the wall-clock limit on queued **or live** jobs |
+| `class …` | Create, list, inspect, pause, unpause, cancel, or set the window of a job class |
+| `set-class JOB CLASS` | Change a queued or held job's class; `--clear` removes membership |
+| `set-run-window JOB WINDOW` | Change a queued or held job's daily window; `--clear` removes it |
 | `follow-tts` | Speak completions and newly running work via local `tts` |
 | `daemon …` | `status` / `run` / `install` / `uninstall` |
 | `recover …` | List or resolve orphaned/quarantined attempts |
@@ -186,7 +336,7 @@ Common flags:
 - `--json` on most commands for machine-readable output
 - `--idempotency-key KEY` on mutations (auto-generated if omitted; safe to
   retry an identical request)
-- Submit: `--name`, `--cwd`, `--env KEY=VAL`, `--inherit-env VAR`,
+- Submit: `--name`, `--default`, `--class`, `--run-window`, `--cwd`, `--env KEY=VAL`, `--inherit-env VAR`,
   `--max-attempts`, `--retry-delay`, `--time-limit`, `--after-success JOB`,
   `--after-terminal JOB`
 

@@ -54,9 +54,67 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum DefaultCommand {
+    /// Stop the default and disable recurrence, keeping its saved command.
+    End {
+        /// Escalate to SIGKILL after the cancellation grace period.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Requeue the saved default command when idle capacity is available.
+    Start,
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Submit a command to the queue.
     Submit(SubmitArgs),
+    /// Inspect, stop, or restart the default idle job.
+    #[command(subcommand_negates_reqs = true, arg_required_else_help = true)]
+    Default {
+        #[arg(long, required = true)]
+        command: Option<String>,
+        #[arg(long, global = true)]
+        json: bool,
+        #[command(subcommand)]
+        action: Option<DefaultCommand>,
+    },
+    /// Page through attempt history, newest first.
+    Attempts {
+        job: JobId,
+        /// Return attempts with numbers below this cursor.
+        #[arg(long)]
+        before: Option<i64>,
+        #[arg(long, default_value_t = 25)]
+        limit: u32,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect and control named groups of jobs.
+    Class {
+        #[command(subcommand)]
+        command: ClassCommand,
+    },
+    /// Set a queued or held job's class, or remove it with --clear.
+    SetClass {
+        job: JobId,
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        class: Option<String>,
+        #[arg(long)]
+        clear: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change a queued or held job's daily execution window.
+    SetRunWindow {
+        job: JobId,
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        run_window: Option<crate::run_window::RunWindow>,
+        #[arg(long)]
+        clear: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Show queue state, concurrency declarations, and admission reasons.
     Status {
         #[arg(long)]
@@ -187,6 +245,57 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum ClassCommand {
+    /// Create a class before submitting its jobs.
+    Create {
+        name: String,
+        /// Daily window, e.g. 23:00-07:00@-04:00. Default offset is UTC.
+        #[arg(long)]
+        run_window: Option<crate::run_window::RunWindow>,
+        #[arg(long)]
+        json: bool,
+    },
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    Show {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop new admissions for this class. Running jobs continue.
+    Pause {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Unpause {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Change the shared window. Requires no live attempts in this class.
+    SetRunWindow {
+        name: String,
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        run_window: Option<crate::run_window::RunWindow>,
+        #[arg(long)]
+        clear: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Cancel all unfinished jobs in the class atomically.
+    Cancel {
+        name: String,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum DaemonCommand {
     /// Report daemon liveness and counters.
     Status {
@@ -243,6 +352,15 @@ struct SubmitArgs {
     /// Job name (defaults to the executable's basename).
     #[arg(long)]
     name: Option<String>,
+    /// Repeat during idle periods. Stop for ordinary work and restart later.
+    #[arg(long = "default")]
+    is_default: bool,
+    /// Existing job class to join.
+    #[arg(long)]
+    class: Option<String>,
+    /// Daily execution window, e.g. 23:00-07:00@-04:00. Default offset is UTC.
+    #[arg(long)]
+    run_window: Option<crate::run_window::RunWindow>,
     /// Working directory (defaults to the current directory), canonicalized.
     #[arg(long)]
     cwd: Option<PathBuf>,
@@ -295,11 +413,85 @@ pub fn main() -> Result<()> {
 
     match cli.command {
         Command::Submit(args) => submit(&paths, args, key),
+        Command::Default {
+            command,
+            json,
+            action,
+        } => {
+            if let Some(action) = action {
+                if command.is_some() {
+                    bail!("--command is only supported for default lookup");
+                }
+                let op = match action {
+                    DefaultCommand::End { force } => Op::DefaultEnd { force },
+                    DefaultCommand::Start => Op::DefaultStart,
+                };
+                return mutate_job(&paths, op, key, json);
+            }
+            let command = command.context("default lookup requires --command")?;
+            let Reply::DefaultJob { job } = send(&paths, Op::DefaultJob { command }, None)? else {
+                bail!(client::unexpected("default job"))
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(&job)?);
+            } else if let Some(job) = job {
+                print_job_detail(&job);
+            } else {
+                println!("no default job found");
+            }
+            Ok(())
+        }
+        Command::Attempts {
+            job,
+            before,
+            limit,
+            json,
+        } => {
+            let Reply::Attempts {
+                attempts,
+                next_before,
+            } = send(&paths, Op::Attempts { job, before, limit }, None)?
+            else {
+                bail!(client::unexpected("attempts"))
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "attempts": attempts, "nextBefore": next_before,
+                    }))?
+                );
+            } else {
+                for attempt in attempts {
+                    println!(
+                        "attempt {} {}  {}",
+                        attempt.number, attempt.state, attempt.log_dir
+                    );
+                }
+                if let Some(before) = next_before {
+                    println!("older: mlq attempts {job} --before {before}");
+                }
+            }
+            Ok(())
+        }
         Command::Status {
             watch,
             finished,
             json,
         } => status(&paths, watch, finished, json),
+        Command::Class { command } => class_command(&paths, command, key),
+        Command::SetClass {
+            job,
+            class,
+            clear: _,
+            json,
+        } => mutate_job(&paths, Op::SetClass { job, class }, key, json),
+        Command::SetRunWindow {
+            job,
+            run_window,
+            clear: _,
+            json,
+        } => mutate_job(&paths, Op::SetRunWindow { job, run_window }, key, json),
         Command::Subscribe => subscribe(&paths),
         Command::FollowTts { tts_backend } => follow_tts(&paths, tts_backend.as_deref()),
         Command::Show { job, json } => {
@@ -462,6 +654,87 @@ fn send(paths: &Paths, op: Op, key: Option<String>) -> Result<Reply> {
     }
 }
 
+fn class_command(paths: &Paths, command: ClassCommand, key: String) -> Result<()> {
+    let (op, json) = match command {
+        ClassCommand::Create {
+            name,
+            run_window,
+            json,
+        } => (Op::ClassCreate { name, run_window }, json),
+        ClassCommand::List { json } => (Op::Classes, json),
+        ClassCommand::Show { name, json } => (Op::ClassShow { name }, json),
+        ClassCommand::Pause { name, json } => (Op::ClassPause { name, paused: true }, json),
+        ClassCommand::Unpause { name, json } => (
+            Op::ClassPause {
+                name,
+                paused: false,
+            },
+            json,
+        ),
+        ClassCommand::SetRunWindow {
+            name,
+            run_window,
+            clear: _,
+            json,
+        } => (Op::ClassSetWindow { name, run_window }, json),
+        ClassCommand::Cancel { name, force, json } => (Op::ClassCancel { name, force }, json),
+    };
+    let cancel = matches!(op, Op::ClassCancel { .. });
+    let mutation_key = op.is_mutation().then_some(key);
+    let reply = send(paths, op, mutation_key)?;
+    match reply {
+        Reply::Classes { classes } => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&classes)?);
+            } else {
+                for class in classes {
+                    print_class(&class);
+                }
+            }
+        }
+        Reply::Class { class } => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&class)?);
+            } else {
+                print_class(&class);
+                if cancel {
+                    println!("cancellation requested for class {}", class.name);
+                }
+            }
+        }
+        Reply::ClassJobs { class, jobs } => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({ "class": class, "jobs": jobs })
+                    )?
+                );
+            } else {
+                print_class(&class);
+                for job in jobs {
+                    print_job_detail(&job);
+                }
+            }
+        }
+        _ => bail!(client::unexpected("class")),
+    }
+    Ok(())
+}
+
+fn print_class(class: &crate::protocol::ClassView) {
+    println!(
+        "class {} paused={} window={}",
+        class.name,
+        class.paused,
+        class
+            .run_window
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| "unrestricted".into())
+    );
+}
+
 fn mutate_job(paths: &Paths, op: Op, key: String, json: bool) -> Result<()> {
     let reply = send(paths, op.clone(), Some(key))?;
     let Reply::Job { job } = reply else {
@@ -497,7 +770,26 @@ fn mutate_pause(paths: &Paths, op: Op, key: String, json: bool) -> Result<()> {
 /// (state stays starting/running until the process group drains), so that path
 /// reports intent rather than a false "is now running".
 fn format_mutation_message(op: &Op, job: &JobView) -> String {
-    if let Op::Cancel { force, .. } = op
+    if matches!(op, Op::SetClass { .. }) {
+        return format!(
+            "job {} [{}] class is now {}",
+            job.id,
+            job.name,
+            job.class.as_deref().unwrap_or("unassigned")
+        );
+    }
+    if matches!(op, Op::SetRunWindow { .. }) {
+        return format!(
+            "job {} [{}] run window is now {}",
+            job.id,
+            job.name,
+            job.run_window
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "unrestricted".into())
+        );
+    }
+    if let Op::Cancel { force, .. } | Op::DefaultEnd { force } = op
         && matches!(
             job.state.as_str(),
             "starting" | "running" | "needs_attention"
@@ -608,6 +900,9 @@ fn submit(paths: &Paths, args: SubmitArgs, key: String) -> Result<()> {
         .transpose()?;
     let params = SubmitParams {
         name,
+        is_default: args.is_default,
+        class: args.class,
+        run_window: args.run_window,
         cwd: cwd.display().to_string(),
         args: args.command,
         env,
@@ -1093,6 +1388,7 @@ fn status_sections(
     });
     queued.sort_by_key(|job| {
         (
+            job.is_default,
             job.ready_sequence.is_none(),
             Reverse(job.priority),
             job.ready_sequence.unwrap_or(i64::MAX),
@@ -1139,12 +1435,15 @@ fn write_status_job(output: &mut String, job: &JobView) {
         .as_deref()
         .or(job.state_reason.as_deref())
         .filter(|reason| !reason.is_empty() && *reason != "-");
-    let reason = match (job.cancel_requested == Some(true), prior) {
+    let mut reason = match (job.cancel_requested == Some(true), prior) {
         (true, Some(prior)) => format!("cancel_requested; {prior}"),
         (true, None) => "cancel_requested".to_string(),
         (false, Some(prior)) => prior.to_string(),
         (false, None) => "-".to_string(),
     };
+    if job.is_default {
+        reason = format!("default_idle; {reason}");
+    }
     writeln!(
         output,
         "{:<6} {:<width$} {:<15} {:<3} {:<3} {:<5} {}",
@@ -1162,6 +1461,18 @@ fn write_status_job(output: &mut String, job: &JobView) {
 
 fn print_job_detail(job: &JobView) {
     println!("job {} [{}]", job.id, job.name);
+    if job.is_default {
+        println!("  default idle job:  yes");
+    }
+    if let Some(class) = &job.class {
+        println!("  class:            {class}");
+    }
+    if let Some(window) = &job.run_window {
+        println!("  run window:       {window}");
+    }
+    if let Some(window) = &job.class_run_window {
+        println!("  class window:     {window}");
+    }
     println!(
         "  state:            {}{}",
         job.state,
@@ -1207,6 +1518,12 @@ fn print_job_detail(job: &JobView) {
         println!(
             "  time limit:       {} per attempt",
             humantime::format_duration(Duration::from_millis(limit))
+        );
+    }
+    if job.attempts_truncated {
+        println!(
+            "  recent attempts; use mlq attempts {} for older history",
+            job.id
         );
     }
     for attempt in &job.attempts {
@@ -1492,6 +1809,128 @@ fn shell_join(args: &[String]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn default_controls_parse_and_preserve_command_lookup() {
+        let cli = Cli::try_parse_from(["mlq", "default", "end", "--force", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Default {
+                action: Some(DefaultCommand::End { force: true }),
+                json: true,
+                ..
+            }
+        ));
+        let cli = Cli::try_parse_from(["mlq", "default", "--json", "start"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Default {
+                action: Some(DefaultCommand::Start),
+                json: true,
+                ..
+            }
+        ));
+        let cli =
+            Cli::try_parse_from(["mlq", "default", "--command", "/bin/idle", "--json"]).unwrap();
+        let Command::Default {
+            command,
+            action,
+            json,
+        } = cli.command
+        else {
+            panic!("expected default lookup")
+        };
+        assert_eq!(command.as_deref(), Some("/bin/idle"));
+        assert!(action.is_none());
+        assert!(json);
+        let help = Cli::try_parse_from(["mlq", "default"]).err().unwrap();
+        assert_eq!(
+            help.kind(),
+            clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
+        let text = help.to_string();
+        assert!(text.contains("end"));
+        assert!(text.contains("start"));
+    }
+
+    #[test]
+    fn class_and_window_commands_parse_without_contacting_a_daemon() {
+        let cli = Cli::try_parse_from([
+            "mlq",
+            "submit",
+            "--class",
+            "night",
+            "--run-window",
+            "23:00-07:00@-04:00",
+            "--",
+            "true",
+        ])
+        .unwrap();
+        let Command::Submit(args) = cli.command else {
+            panic!("expected submit")
+        };
+        assert_eq!(args.class.as_deref(), Some("night"));
+        assert_eq!(args.run_window.unwrap().to_string(), "23:00-07:00@-04:00");
+        for args in [
+            vec![
+                "mlq",
+                "class",
+                "create",
+                "night",
+                "--run-window",
+                "23:00-07:00",
+            ],
+            vec!["mlq", "class", "show", "night", "--json"],
+            vec!["mlq", "class", "list", "--json"],
+            vec!["mlq", "class", "pause", "night"],
+            vec!["mlq", "class", "unpause", "night"],
+            vec!["mlq", "class", "cancel", "night", "--force"],
+            vec!["mlq", "class", "set-run-window", "night", "--clear"],
+            vec!["mlq", "set-run-window", "42", "23:00-07:00"],
+            vec!["mlq", "set-run-window", "42", "--clear"],
+            vec!["mlq", "set-class", "42", "night"],
+            vec!["mlq", "set-class", "42", "--clear"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        for args in [
+            vec!["mlq", "class", "set-run-window", "night"],
+            vec!["mlq", "set-run-window", "42"],
+            vec!["mlq", "set-class", "42"],
+            vec!["mlq", "set-class", "42", "night", "--clear"],
+            vec!["mlq", "set-run-window", "42", "23:00-07:00", "--clear"],
+            vec!["mlq", "submit", "--run-window", "24:00-07:00", "--", "true"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
+    fn default_job_flag_and_status_are_visible() {
+        let cli = Cli::try_parse_from(["mlq", "submit", "--default", "--", "true"]).unwrap();
+        let Command::Submit(args) = cli.command else {
+            panic!("expected submit")
+        };
+        assert!(args.is_default);
+        let mut idle = status_job(1, "queued", None);
+        idle.is_default = true;
+        idle.priority = i64::MAX;
+        let ordinary = status_job(2, "queued", None);
+        let snapshot = StatusView {
+            jobs: vec![idle, ordinary],
+            active_leases: 0,
+            effective_limit: None,
+            reservation: None,
+            admission_blocked: false,
+            paused: false,
+        };
+        let (_, queued, _, _) = status_sections(&snapshot);
+        assert_eq!(
+            queued.iter().map(|job| job.id).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert!(render_status(&snapshot, false).contains("default_idle"));
+    }
+
     fn event(id: i64, job: JobId, name: &str, event_type: &str) -> EventView {
         EventView {
             id,
@@ -1508,6 +1947,10 @@ mod tests {
         JobView {
             id,
             name: format!("{state}-{id}"),
+            is_default: false,
+            class: None,
+            run_window: None,
+            class_run_window: None,
             state: state.into(),
             eligibility: None,
             state_reason: None,
@@ -1526,6 +1969,7 @@ mod tests {
             finished_at,
             dependencies: vec![],
             attempts: vec![],
+            attempts_truncated: false,
             cancel_requested: None,
         }
     }
@@ -1553,6 +1997,10 @@ mod tests {
             &job,
         );
         assert_eq!(force, "job 106 [normuon_2k] cancel requested (force)");
+        assert_eq!(
+            format_mutation_message(&Op::DefaultEnd { force: true }, &job),
+            force
+        );
     }
 
     #[test]

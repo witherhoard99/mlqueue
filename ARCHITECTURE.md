@@ -23,7 +23,8 @@ The daemon does **not**:
 - Discover GPUs or parse NVIDIA/ROCm telemetry
 - Meter or reserve VRAM, RAM, CPU, or wall time
 - Infer workload type from commands or repositories
-- Preempt, suspend, or checkpoint healthy work
+- Preempt ordinary work, or suspend or checkpoint commands. Only an explicitly
+  submitted default idle job yields automatically to ordinary work.
 - Detect unmanaged processes or foreign GPU use
 - Accept remote submission or multi-user isolation
 
@@ -53,6 +54,7 @@ src/config.rs           TOML config
 src/paths.rs            XDG paths (overridable in tests)
 src/domain.rs           IDs, states, scheduler semantics version
 src/protocol.rs         wire ops, public camelCase views, framing
+src/run_window.rs       validated daily windows with fixed UTC offsets
 src/db.rs               migrations, repositories, operations, events
 src/scheduler.rs        pure admission + backfill policy (no I/O)
 src/daemon/
@@ -186,7 +188,7 @@ operator migrates or invalidates the reservation (`admission_blocked`).
 - Unix stream socket, big-endian `u32` length-prefixed JSON
 - Hard frame limit checked before allocation
 - Peer UID must match the daemon
-- Protocol version is exact-match (currently **8**)
+- Protocol version is exact-match (currently **9**). Update the CLI and daemon together.
 - Mutations require a durable **idempotency key**; identical retry returns the
   original result; same key + different payload → conflict
 
@@ -223,8 +225,8 @@ being request/response and becomes a one-way stream of `status` replies.
 - The stream ends on client EOF (or any further bytes from the client, which
   would desynchronise it) and on daemon shutdown, which drops the coordinator's
   sender.
-- Purely additive: no new reply type, no view change, so `PROTOCOL_VERSION`
-  stays 8. An older daemon rejects `subscribe` as a malformed request.
+- Subscriptions use the same protocol version as other requests. An older
+  daemon rejects an unrecognized operation as a malformed request.
 
 ### Job event subscriptions and local following
 
@@ -232,8 +234,8 @@ being request/response and becomes a one-way stream of `status` replies.
 `job_update` replies. Its initial read transaction captures the current compact
 job snapshot (latest attempt only) and the global event head together, with no
 historical event replay. Supplying `after` resumes after that durable cursor.
-This additive operation does not change existing request/reply shapes; protocol
-version stays 8. Older daemons reject the new operation; update `mlqd` with `mlq`.
+Job subscriptions use the current protocol version. Older daemons reject
+unrecognized operations; update `mlqd` with `mlq`.
 
 Each update contains `job`, `cursor`, `events`, and `hasMore`. Event pages use the
 existing job index with a cursor seek, at most 256 records plus lookahead, and
@@ -298,9 +300,10 @@ readiness sequence; historical cancelled and skipped records remain truthful.
 
 | Table | Role |
 |---|---|
-| `jobs` | Command, cwd, env, state, concurrency/priority, readiness order, retries, optional time limit, timestamps |
+| `jobs` | Command, cwd, env, state, class, daily window, default role, concurrency/priority, readiness order, retries, optional time limit, timestamps |
+| `job_classes` | Named groups, admission pause, shared daily window, timestamps |
 | `dependencies` | Immutable parent conditions with monotonic observed-outcome resolution |
-| `attempts` | Launch token, state, copied limit, runner/command identity, exit |
+| `attempts` | Launch token, state, copied limit, absolute window close, durable default yield, runner/command identity, exit |
 | `run_leases` | One active lease per attempt; source of truth for the formula |
 | `scheduler_reservation` | Protected job, cutoff, initial blockers, semantics version |
 | `scheduler_reservation_backfills` | One bypass consumption per job per reservation |
@@ -372,6 +375,79 @@ valid, quarantine corrupt identity, retain leases for orphans.
 - The detached runner owns the monotonic deadline, so daemon restart does not
   reset it. The command spawn time is also persisted; if the runner dies, the
   daemon takes over SIGTERM/SIGKILL enforcement while retaining the lease.
+
+### Job classes and execution windows
+
+Migration v8 adds `job_classes`, optional class membership and windows on jobs,
+and `attempts.window_end_at`. Existing jobs remain unrestricted. Classes must
+exist before use and keep the global concurrency rules.
+
+SQLite and JSON store windows as `HH:MM-HH:MM@+HH:MM` or `HH:MM-HH:MM@-HH:MM`.
+Offsets are fixed; omission means UTC. Windows include the start, exclude the
+end, and can cross midnight. Both job and class windows must be open. Class
+pauses and closed windows exclude jobs before protection/backfill planning.
+The scheduler invalidates reservations for excluded jobs and preserves their
+readiness order.
+
+The admission transaction stores the earliest window close with the attempt
+and lease. `command.json` copies it. The runner refuses late launches, sends
+SIGTERM at close, and escalates to SIGKILL after grace. The lease stays active
+until the process group exits. Shutdown may extend beyond the window during
+grace. `runner.log` records closure and signals; `result.json` reports
+`window_closed`. The attempt fails under the normal retry policy. Live
+`limit.json` edits cannot change the window deadline. `timeout.json` lets the
+daemon continue termination if the runner dies.
+
+Only queued or held jobs can change class or window. Class windows require no
+live attempts; class pauses affect new starts only. Class cancellation records
+all members' cancellations before sending signals. An unsafe member rejects the
+request. Mutations record idempotency keys and lifecycle events.
+
+Protocol v9 adds class and window operations. Absent submit fields stay omitted
+to preserve older request hashes. Job views add `class`, `runWindow`, and
+`classRunWindow`; attempt views add the fixed `windowEndAt`.
+
+### Default idle job
+
+Migration v9 adds `jobs.is_default` and `attempts.yield_requested`, both false
+on existing records. A partial unique index permits one unfinished default,
+including held and recovery states. Ordinary candidates come first in
+priority/readiness order. The default never enters protection or backfill;
+it starts only when no ordinary candidate or active lease exists.
+
+When ordinary work becomes ready, the coordinator commits the default's yield
+and forced cancellation before publishing `cancel.json`. Existing runner and
+orphan recovery code enforce the signals. The lease stays active until the
+process group exits. Prepared attempts can release immediately because they
+have no start authorization. Quarantine still requires operator recovery.
+
+Success or scheduler yield requeues the default after at least one second.
+Failures use its retry budget, counted since the last success or yield.
+User cancellation clears restart intent in the same transaction. Defaults
+obey class and window rules. They cannot depend on other jobs or serve as
+prerequisites. Upgrading the binaries does not install a default command.
+
+`default end` and `default start` select the active default or the latest saved
+default in the same transaction as their mutation. Ending uses normal
+cancellation and clears yield intent. Starting requeues a terminal or held
+default without changing its command or attempt history. An already active
+default stays active. Pending cancellation and unresolved recovery prevent a
+start until containment is resolved. Both operations use durable idempotency keys.
+
+Boot registration uses a dedicated database lookup for the active default or
+the command's latest default. It does not depend on status's recent-history
+limit. A changed boot ID proves an active default's old group is gone. Recovery
+records the interrupted attempt as lost and requeues the default if its failure
+budget remains. User cancellation, holds, quarantine, and committed timeouts
+keep their normal outcomes. A valid runner result takes precedence.
+
+Job detail includes the latest 25 attempts and reports `attemptsTruncated` when
+older records exist. `attempts` pages history by descending attempt number with
+an exclusive `before` cursor and a limit of 1 to 100. Single-job mutation replies
+omit attempt history, including the reply stored for idempotency. Recurring
+defaults therefore do not grow those replies on each restart. Replaying an
+older cached reply compacts its attempt history without changing the request
+hash or operation outcome.
 
 ### Group emptiness
 

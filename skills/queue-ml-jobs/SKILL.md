@@ -1,86 +1,85 @@
 ---
 name: queue-ml-jobs
-description: Queue and manage local machine-learning workloads with mlq. Use for local training, evaluation, preprocessing, or benchmarks that consume shared CPU or GPU resources, and for inspecting or controlling the mlq queue or daemon.
+description: Submit, monitor, schedule, and control local ML workloads with mlq.
 ---
 
 # Queue local ML work
 
-- Submit managed workloads with `mlq submit`; never run them directly or bypass
-  the queue.
-- Use `mlq follow JOB` instead of the removed `wait` command. It subscribes until
-  the final outcome or a 55-minute observation timeout, and exits with the
-  command's status (or `128 + signal`) on completion. Plain `follow` prints only
-  final output: no polling, heartbeats, log tails, hooks, checks, or LLM calls.
-  On timeout it prints `follow timed out after 55 minutes` and exits `124`;
-  the job is untouched. `--timeout DURATION` overrides the observation duration.
-- The 55-minute default leaves headroom for a 60-minute agent KV-cache TTL.
-  After timeout, reassess: reattach with `mlq follow JOB` only if waiting is still
-  useful; otherwise record the job ID and stop following. Never resubmit or retry
-  the workload solely because following timed out. Avoid an unattended shell
-  loop around `follow`: return control to the agent between observation windows.
-- Opt into intermediate events only when actionable: `--events started,retry`
-  or an explicit `--config follow.toml`. Checks require `warning` selection.
-  `--only-finish` overrides intermediate events/checks; `--no-hooks` also disables
-  explicitly configured finish notifications. `--json` emits compact NDJSON,
-  not full job history; use `show JOB --json` for detail. Never poll an LLM to
-  interpret metrics.
-- You may need to start `mlqd` if it fails.
-- When authorized to update this installation, build with `cargo build --release
-  --locked`, then `mlq-update stage --mlqd target/release/mlqd` before upgrading
-  the CLI with `cargo install --path . --locked --force --bin mlq`. The configured
-  updater activates only when no unfinished jobs or active leases remain.
-  Do not directly replace/restart a busy daemon or install both binaries.
-  `mlq-update status` shows the pending candidate; staging never fetches Git.
-- Keep each workload and its descendants foregrounded in the runner's process
-  group. Restructure commands that daemonize or call `setsid`.
-- Choose `--max-parallel-runs N` explicitly for every submission. It asserts
-  that the job is safe while at most `N` total managed jobs are running,
-  regardless of workload type; it is not a utilization target. Use `1` for
-  unknown, exclusive, multi-GPU, or benchmark-sensitive work. Raise it only
-  from evidence that mixed concurrent workloads remain safe.
-- Omit `--priority` for the default priority `0`. Use a signed value only when
-  queue precedence is intentional. Higher-priority eligible jobs rank first;
-  equal priorities retain the queue's FIFO/backfill rules, and running jobs
-  are never preempted. Never increase priority merely to advance your own work.
+## Submit work
+
+Submit every workload through `mlq`. Keep its descendants in the runner's
+foreground process group. Start `mlqd` if needed.
 
 ```bash
-mlq submit --name NAME --max-parallel-runs N \
-  --cwd /absolute/repository/path -- COMMAND...
+mlq submit --name NAME --max-parallel-runs N --cwd /absolute/path -- COMMAND...
 ```
 
-- Add `--time-limit DURATION` when a hard per-attempt wall-clock bound is
-  operationally reasonable. Choose a defensible, generous duration from
-  workload evidence; queue wait is excluded, but command startup, compilation,
-  and descendants count toward the limit. Prefer a limit when an overlong run
-  likely indicates a hang or would waste shared resources. Leave the job
-  unlimited when valid runtimes are too variable to bound safely.
-- For sequential or conditional work, use durable queue dependencies:
-  `--after-success JOB` runs only after a successful prerequisite, while
-  `--after-terminal JOB` runs after any terminal outcome. Repeat flags for an
-  AND gate. Use `mlq follow` in the submitter for output-derived commands, or
-  explicitly configure cheap local warning checks for metric conditions. Checks
-  notify; they never cancel/retry the job. Keep keys stable and advance metric
-  steps only for new observations so persistent findings do not waste tokens.
-- Pass required environment explicitly. Values supplied through `--env` are
-  stored as plaintext; make workloads read secrets from credential files.
-- Change a queued or running job with
-  `mlq set-max-parallel-runs JOB N` when evidence changes its safe limit.
-  Lowering below the current active-lease count is allowed: existing work
-  keeps running, and new admissions wait until the set drains.
-- Change a queued or held job's order with `mlq set-priority JOB P`. Running
-  jobs cannot change priority (no preemption). Do not raise priority merely to
-  jump the queue for your own work.
-- Change a queued or running job's wall-clock bound with
-  `mlq set-time-limit JOB DURATION`, or remove it with `--clear`. The clock
-  stays anchored at command spawn. Shortening below the time already elapsed
-  stops that attempt; once termination has started, extending it does not
-  revive the attempt. An earlier cancellation stays cancelled. Later retries
-  use the updated limit.
-- Use `mlq status`, `show`, `see`, and `logs` to observe work, and `cancel` or
-  `retry` to control it. Report the submitted job ID, chosen parallel limit,
-  chosen time limit (or the decision to leave it unlimited), and any nonzero
-  priority.
-- If `mlq status` reports the queue is paused, new work will not start until
-  an operator runs `mlq unpause`. Do not pause or unpause the shared queue
-  unless the user asked.
+- Set `--max-parallel-runs N` to the safe total number of concurrent managed
+  jobs, including this one. Use `1` for unknown or exclusive work.
+- Omit `--priority` unless queue order matters. Higher values go first; equal
+  priorities use FIFO. Ordinary running jobs are not preempted.
+- Set retries with `--max-attempts` and `--retry-delay`. `--time-limit` bounds
+  each attempt, excluding queue wait.
+- Pass environment with `--env KEY=VALUE` or `--inherit-env VAR`. Dependencies
+  use `--after-success JOB` or `--after-terminal JOB`; repeated flags are ANDed.
+- Add `--default`, `--class NAME`, or `--run-window WINDOW` for scheduling below.
 
+## Command guide
+
+Commands below follow `mlq`. Use `--help` for full syntax, `--json` where
+supported, and the same `--idempotency-key KEY` when retrying an identical mutation.
+
+| Command | Use |
+| --- | --- |
+| `status [--watch]` / `status --finished` | Inspect the live queue and admission reasons, or recent finished jobs. |
+| `show JOB` / `see [JOB]` | Read job details and the latest 25 attempts, or details with stdout. `see` defaults to the latest job. |
+| `attempts JOB [--before N] [--limit N]` | Page history newest first. The cursor is exclusive; the limit is 1 to 100. |
+| `logs JOB [--attempt N] [--stderr] [--follow]` | Read or follow captured output; the latest attempt is the default. |
+| `follow JOB [--timeout DURATION]` | Wait for the final outcome. The default timeout is 55m; expiry exits 124 and leaves the job running. |
+| `follow JOB [--events EVENTS] [--config FILE]` | Enable selected events or TOML checks/hooks. Checks report metrics only. |
+| `subscribe` / `follow-tts` | Stream queue snapshots as NDJSON, or speak transitions through local `tts`. |
+| `cancel JOB [--force]` | Cancel a job with SIGTERM; `--force` adds SIGKILL after the grace period. |
+| `hold JOB` / `release JOB` | Park a queued job or return a held job to the queue. |
+| `retry JOB` | Requeue a failed or lost job for another attempt. |
+| `set-max-parallel-runs JOB N` | Change a queued or live job's concurrency declaration. |
+| `set-priority JOB P` | Change a queued or held job's priority. |
+| `set-time-limit JOB DURATION` / `--clear` | Change or remove a queued or live job's limit, measured from its original start. |
+| `default --command PATH` | Look up the active default or the command's latest default history. |
+| `default end [--force]` / `default start` | Stop recurrence or restart the saved command after it has stopped. |
+| `class create NAME [--run-window WINDOW]` | Create a class before submitting members with `--class NAME`. |
+| `class list` / `class show NAME` | Inspect class pause states and windows. |
+| `class pause NAME` / `class unpause NAME` | Stop or resume new starts for a class. |
+| `class cancel NAME [--force]` | Cancel all unfinished members; quarantined members reject the operation. |
+| `class set-run-window NAME WINDOW` / `--clear` | Change or remove the class window when it has no live attempts. |
+| `set-class JOB CLASS` / `set-run-window JOB WINDOW` | Change a queued or held job's membership or window; `--clear` removes it. |
+| `pause` / `unpause` | Stop or resume new queue admissions. Running jobs continue. Change this gate only when asked. |
+| `daemon status` / `run` / `install` / `uninstall` | Inspect, run in the foreground, install, or remove the systemd user service. |
+| `recover list` / `recover resolve JOB --attempt N --as lost` | Inspect orphaned/quarantined attempts; resolve only after their processes are gone. `--as cancelled` is also supported. |
+
+## Scheduling rules
+
+A default job runs alone during idle periods and yields to eligible ordinary
+work. Only one unfinished default is allowed; it requires concurrency `1` and
+cannot participate in dependencies. Success or yield restarts the command, so
+checkpoint work. Failures consume the retry budget since the last success or
+yield. Holding, cancelling, quarantine, or exhausted retries stops recurrence.
+
+Windows repeat daily, for example `23:00-07:00@-04:00`. Offsets are fixed;
+omitting one means UTC. Both job and class windows must be open. Window closure
+terminates the attempt and applies normal retries. Classes share the global
+concurrency rules. Queue and class pauses leave running attempts alone.
+
+## Daemon updates
+
+Stop the default job before updating. Do not replace or restart a busy daemon.
+Build and stage the daemon before installing the CLI from the same build:
+
+```bash
+cargo build --release --locked -j10
+mlq-update stage --mlqd target/release/mlqd
+cargo install --path . --locked --force --bin mlq
+mlq-update status
+```
+
+Staging never fetches Git. See [README.md](../../README.md) for detailed behavior
+and configuration examples.

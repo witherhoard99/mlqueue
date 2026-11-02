@@ -376,7 +376,7 @@ fn job_in(snapshot: &serde_json::Value, id: i64) -> &serde_json::Value {
 
 /// The exact bytes a non-Rust consumer sends to open a subscription.
 const RAW_SUBSCRIBE: &[u8] =
-    br#"{"protocol_version":8,"request_id":"raw-1","op":{"type":"subscribe"}}"#;
+    br#"{"protocol_version":9,"request_id":"raw-1","op":{"type":"subscribe"}}"#;
 
 fn raw_subscribe(socket: &std::path::Path) -> (std::os::unix::net::UnixStream, serde_json::Value) {
     try_raw_subscribe(socket).expect("the daemon answered the subscribe request")
@@ -1988,6 +1988,71 @@ fn set_priority_updates_queued_jobs_and_rejects_running() {
     q.wait_state(first, "running", Duration::from_secs(10));
     q.cli(&["cancel", &first.to_string()]);
     q.wait_state(first, "cancelled", Duration::from_secs(10));
+}
+
+#[test]
+fn default_end_and_start_reuse_the_command_and_preserve_attempt_history() {
+    let q = TestQueue::new();
+    let idle = q.submit(
+        &["--default", "--name", "idle-work"],
+        &["sh", "-c", "exec sleep 30"],
+    );
+    q.wait_state(idle, "running", Duration::from_secs(10));
+    let first = q.job(idle);
+    assert_eq!(first["attemptCount"], 1);
+
+    q.cli(&["default", "end"]);
+    q.wait_state(idle, "cancelled", Duration::from_secs(10));
+    assert_eq!(q.status()["activeLeases"], 0);
+
+    // Ordinary work still takes precedence when the saved default is started.
+    let ordinary = q.submit(&[], &["sleep", "30"]);
+    q.wait_state(ordinary, "running", Duration::from_secs(10));
+    q.cli(&["default", "start"]);
+    assert_eq!(q.job_state(idle), "queued");
+    assert_eq!(q.job(idle)["attemptCount"], 1);
+    q.cli(&["cancel", &ordinary.to_string()]);
+    q.wait_state(ordinary, "cancelled", Duration::from_secs(10));
+    q.wait_state(idle, "running", Duration::from_secs(10));
+
+    let restarted = q.job(idle);
+    assert_eq!(restarted["args"], first["args"]);
+    assert_eq!(restarted["cwd"], first["cwd"]);
+    assert_eq!(restarted["attemptCount"], 2);
+    assert_eq!(restarted["attempts"][0]["state"], "cancelled");
+
+    // Starting an already active default must not launch another copy.
+    q.cli(&["default", "start"]);
+    assert_eq!(q.job(idle)["attemptCount"], 2);
+    assert_eq!(q.status()["activeLeases"], 1);
+    q.cli(&["default", "end"]);
+    q.wait_state(idle, "cancelled", Duration::from_secs(10));
+}
+
+#[test]
+fn default_start_finds_an_ended_command_after_daemon_restart_and_newer_jobs() {
+    let mut q = TestQueue::new();
+    q.cli(&["pause"]);
+    let idle = q.submit(&["--default"], &["sleep", "30"]);
+    q.cli(&["default", "end"]);
+    assert_eq!(q.job_state(idle), "cancelled");
+    assert_eq!(q.job(idle)["attemptCount"], 0);
+
+    // The saved default is outside the status page and has multiple argv entries.
+    for _ in 0..30 {
+        let ordinary = q.submit(&[], &["true"]);
+        q.cli(&["cancel", &ordinary.to_string()]);
+    }
+    q.stop_daemon();
+    q.start_daemon();
+    assert_eq!(q.job_state(idle), "cancelled");
+    q.cli(&["default", "start"]);
+    assert_eq!(q.job_state(idle), "queued");
+    q.cli(&["unpause"]);
+    q.wait_state(idle, "running", Duration::from_secs(10));
+    assert_eq!(q.job(idle)["attemptCount"], 1);
+    q.cli(&["default", "end"]);
+    q.wait_state(idle, "cancelled", Duration::from_secs(10));
 }
 
 #[test]

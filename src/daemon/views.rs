@@ -12,10 +12,23 @@ use crate::domain::{JobState, now_ms};
 use crate::paths::Paths;
 use crate::protocol::{
     AttemptView, DependencyView, EventView, FollowTtsJobView, FollowTtsSnapshotView, JobView,
-    ReservationView, StatusView,
+    Reply, ReservationView, StatusView,
 };
 
 const TTS_NAME_LIMIT: usize = 80;
+pub const JOB_ATTEMPT_LIMIT: u32 = 25;
+
+/// Keep mutation results independent of a recurring job's history length.
+pub fn compact_mutation_history(reply: &mut Reply) -> bool {
+    if let Reply::Job { job } | Reply::Submitted { job } = reply
+        && (!job.attempts.is_empty() || job.attempts_truncated)
+    {
+        job.attempts.clear();
+        job.attempts_truncated = false;
+        return true;
+    }
+    false
+}
 
 fn status_job_order(a: &JobView, b: &JobView) -> Ordering {
     fn group(job: &JobView) -> u8 {
@@ -64,6 +77,7 @@ pub fn attempt_view(paths: &Paths, attempt: &AttemptRow) -> AttemptView {
         number: attempt.number,
         state: attempt.state.as_str().to_string(),
         max_parallel_runs: attempt.max_parallel_runs,
+        window_end_at: attempt.window_end_at,
         exit_code: attempt.exit_code,
         term_signal: attempt.term_signal,
         message: attempt.message.clone(),
@@ -94,6 +108,15 @@ fn eligibility_reason(
                 Some(format!("waiting_for_dependencies: jobs {parents:?}"))
             } else if db::is_paused(conn)? {
                 Some("paused".to_string())
+            } else if let Some(reason) = db::scheduling_reason(conn, job, now)? {
+                Some(reason.to_string())
+            } else if job.is_default
+                && (!db::active_leases(conn)?.is_empty()
+                    || db::eligible_candidates(conn, now)?
+                        .iter()
+                        .any(|candidate| !candidate.is_default))
+            {
+                Some("default_waiting_for_idle".to_string())
             } else if let Some(res) = reservation {
                 let frontier = db::backfill_frontier(conn, res)?;
                 let protected = db::job_row(conn, res.job_id)?;
@@ -151,9 +174,10 @@ pub fn job_view(
     include_attempts: bool,
 ) -> Result<JobView> {
     let reservation = db::active_reservation(conn)?;
-    let attempts = if include_attempts {
-        db::attempts_for_job(conn, job.id)?
+    let attempts: Vec<_> = if include_attempts {
+        db::attempts_page(conn, job.id, None, JOB_ATTEMPT_LIMIT)?
             .iter()
+            .rev()
             .map(|attempt| attempt_view(paths, attempt))
             .collect()
     } else {
@@ -182,6 +206,16 @@ pub fn job_view(
     Ok(JobView {
         id: job.id,
         name: job.name.clone(),
+        is_default: job.is_default,
+        class: job.class.clone(),
+        run_window: job.run_window.clone(),
+        class_run_window: job
+            .class
+            .as_deref()
+            .map(|name| db::class_row(conn, name))
+            .transpose()?
+            .flatten()
+            .and_then(|class| class.run_window),
         state: job.state.as_str().to_string(),
         eligibility: eligibility_reason(conn, job, reservation.as_ref(), now_ms())?,
         state_reason: job.state_reason.clone(),
@@ -199,6 +233,7 @@ pub fn job_view(
         updated_at: job.updated_at,
         finished_at: job.finished_at,
         dependencies,
+        attempts_truncated: include_attempts && job.attempt_count > attempts.len() as i64,
         attempts,
         cancel_requested,
     })

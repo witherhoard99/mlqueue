@@ -13,7 +13,8 @@ use crate::domain::{
     AttemptId, AttemptState, DependencyCondition, DependencyResolution, JobId, JobState,
     SCHEDULER_SEMANTICS_VERSION, now_ms,
 };
-use crate::protocol::SubmitParams;
+use crate::protocol::{ClassView, SubmitParams};
+use crate::run_window::RunWindow;
 use crate::scheduler::{ActiveLease, Candidate};
 
 const MIGRATIONS: &[&str] = &[
@@ -237,6 +238,28 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE jobs ADD COLUMN time_limit_set_at INTEGER;
     "#,
+    // v8: existing jobs remain unclassified and unrestricted.
+    r#"
+    CREATE TABLE job_classes (
+        name TEXT PRIMARY KEY,
+        paused INTEGER NOT NULL DEFAULT 0 CHECK (paused IN (0, 1)),
+        run_window TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+    );
+    ALTER TABLE jobs ADD COLUMN class TEXT REFERENCES job_classes(name);
+    ALTER TABLE jobs ADD COLUMN run_window TEXT;
+    ALTER TABLE attempts ADD COLUMN window_end_at INTEGER;
+    CREATE INDEX jobs_class ON jobs(class, id);
+    "#,
+    // v9: one recurring, preemptible idle job; yielding is distinct from
+    // an operator cancellation so it can restart after ordinary work drains.
+    r#"
+    ALTER TABLE jobs ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0 CHECK (is_default IN (0, 1));
+    ALTER TABLE attempts ADD COLUMN yield_requested INTEGER NOT NULL DEFAULT 0 CHECK (yield_requested IN (0, 1));
+    CREATE UNIQUE INDEX jobs_one_default ON jobs(is_default)
+        WHERE is_default = 1 AND state NOT IN ('succeeded','failed','cancelled','lost','skipped');
+    "#,
 ];
 
 pub fn open(path: &Path) -> Result<Connection> {
@@ -264,6 +287,10 @@ fn configure(conn: &Connection) -> Result<()> {
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     let current: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    ensure!(
+        current <= MIGRATIONS.len() as i64,
+        "database schema {current} is newer than this binary supports"
+    );
     for (idx, migration) in MIGRATIONS.iter().enumerate() {
         let version = idx as i64 + 1;
         if version <= current {
@@ -281,6 +308,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 pub struct JobRow {
     pub id: JobId,
     pub name: String,
+    pub is_default: bool,
+    pub class: Option<String>,
+    pub run_window: Option<RunWindow>,
     pub state: JobState,
     pub cwd: String,
     pub args: Vec<String>,
@@ -339,6 +369,8 @@ pub struct AttemptRow {
     pub running_at: Option<i64>,
     pub finished_at: Option<i64>,
     pub timed_out_at: Option<i64>,
+    pub window_end_at: Option<i64>,
+    pub yield_requested: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -365,7 +397,7 @@ pub struct EventRow {
 
 const JOB_COLUMNS: &str = "id, name, state, cwd, args, env, max_parallel_runs, priority, \
      max_attempts, retry_delay_ms, time_limit_ms, time_limit_set_at, retry_not_before, ready_seq, \
-     attempt_count, state_reason, created_at, updated_at, finished_at";
+     attempt_count, state_reason, created_at, updated_at, finished_at, class, run_window, is_default";
 
 fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
     let state: String = row.get(2)?;
@@ -391,13 +423,16 @@ fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobRow> {
         created_at: row.get(16)?,
         updated_at: row.get(17)?,
         finished_at: row.get(18)?,
+        class: row.get(19)?,
+        run_window: window_from_row(row, 20)?,
+        is_default: row.get(21)?,
     })
 }
 
 const ATTEMPT_COLUMNS: &str = "id, job_id, number, state, launch_token, max_parallel_runs, \
      runner_pid, runner_start_time, runner_boot_id, cmd_pid, cmd_pgid, cmd_start_time, \
      command_started_at, exit_code, term_signal, cancel_requested, cancel_force, \
-     cancel_requested_at, message, created_at, authorized_at, running_at, finished_at, timed_out_at";
+     cancel_requested_at, message, created_at, authorized_at, running_at, finished_at, timed_out_at, window_end_at, yield_requested";
 
 fn attempt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRow> {
     let state: String = row.get(3)?;
@@ -426,6 +461,8 @@ fn attempt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRow> {
         running_at: row.get(21)?,
         finished_at: row.get(22)?,
         timed_out_at: row.get(23)?,
+        window_end_at: row.get(24)?,
+        yield_requested: row.get(25)?,
     })
 }
 
@@ -433,11 +470,160 @@ fn attempt_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttemptRow> {
 // Jobs
 // ---------------------------------------------------------------------------
 
+fn window_from_row(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<Option<RunWindow>> {
+    let value: Option<String> = row.get(idx)?;
+    value
+        .map(|value| {
+            value.parse().map_err(|err: String| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    idx,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+                )
+            })
+        })
+        .transpose()
+}
+
+pub fn classes(conn: &Connection) -> Result<Vec<ClassView>> {
+    let mut stmt =
+        conn.prepare("SELECT name, paused, run_window FROM job_classes ORDER BY name")?;
+    let rows = stmt.query_map([], class_from_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub fn class_row(conn: &Connection, name: &str) -> Result<Option<ClassView>> {
+    Ok(conn
+        .query_row(
+            "SELECT name, paused, run_window FROM job_classes WHERE name = ?1",
+            [name],
+            class_from_row,
+        )
+        .optional()?)
+}
+
+fn class_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClassView> {
+    Ok(ClassView {
+        name: row.get(0)?,
+        paused: row.get(1)?,
+        run_window: window_from_row(row, 2)?,
+    })
+}
+
+pub fn class_jobs(conn: &Connection, name: &str) -> Result<Vec<JobRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {JOB_COLUMNS} FROM jobs WHERE class = ?1 ORDER BY id"
+    ))?;
+    let rows = stmt.query_map([name], job_from_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+pub fn default_job(conn: &Connection) -> Result<Option<JobRow>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {JOB_COLUMNS} FROM jobs
+                  WHERE is_default = 1
+                    AND state NOT IN ('succeeded','failed','cancelled','lost','skipped')"
+            ),
+            [],
+            job_from_row,
+        )
+        .optional()?)
+}
+
+/// Select the active default, or the most recently submitted default from history.
+pub fn default_for_control(conn: &Connection) -> Result<Option<JobRow>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {JOB_COLUMNS} FROM jobs WHERE is_default = 1
+                 ORDER BY (finished_at IS NULL) DESC, id DESC LIMIT 1"
+            ),
+            [],
+            job_from_row,
+        )
+        .optional()?)
+}
+
+/// Prefer the active default, otherwise find this command's latest default.
+pub fn default_for_command(conn: &Connection, command: &str) -> Result<Option<JobRow>> {
+    let args = serde_json::to_string(&[command])?;
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {JOB_COLUMNS} FROM jobs
+                 WHERE is_default = 1 AND (finished_at IS NULL OR args = ?1)
+                 ORDER BY (finished_at IS NULL) DESC, id DESC LIMIT 1"
+            ),
+            [args],
+            job_from_row,
+        )
+        .optional()?)
+}
+
+/// Count failures since the default last succeeded or yielded.
+pub fn default_failure_count(conn: &Connection, job: JobId) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM attempts
+         WHERE job_id = ?1 AND state = 'failed'
+           AND id > COALESCE((
+               SELECT MAX(id) FROM attempts
+               WHERE job_id = ?1 AND (state = 'succeeded' OR yield_requested = 1)
+           ), 0)",
+        [job],
+        |row| row.get(0),
+    )?)
+}
+
+/// Explain a class pause or closed window. Running attempts are unaffected.
+pub fn scheduling_reason(
+    conn: &Connection,
+    job: &JobRow,
+    now: i64,
+) -> Result<Option<&'static str>> {
+    if let Some(name) = &job.class {
+        let class = class_row(conn, name)?.context("job class missing")?;
+        if class.paused {
+            return Ok(Some("class_paused"));
+        }
+        if class.run_window.as_ref().is_some_and(|w| !w.contains(now)) {
+            return Ok(Some("waiting_for_class_window"));
+        }
+    }
+    if job.run_window.as_ref().is_some_and(|w| !w.contains(now)) {
+        return Ok(Some("waiting_for_run_window"));
+    }
+    Ok(None)
+}
+
+/// Find the earliest window close to store with a new attempt.
+pub fn window_end_at(conn: &Connection, job: &JobRow, now: i64) -> Result<Option<i64>> {
+    let class_window = job
+        .class
+        .as_deref()
+        .map(|name| class_row(conn, name))
+        .transpose()?
+        .flatten()
+        .and_then(|class| class.run_window);
+    let mut end: Option<i64> = None;
+    for window in [job.run_window.as_ref(), class_window.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        let close = window
+            .closing_at(now)
+            .context("attempt cannot start outside its run window")?;
+        end = Some(end.map_or(close, |current| current.min(close)));
+    }
+    Ok(end)
+}
+
 pub fn insert_job(conn: &Connection, params: &SubmitParams, now: i64) -> Result<JobId> {
     conn.execute(
         "INSERT INTO jobs (name, state, cwd, args, env, max_parallel_runs, priority, \
-         max_attempts, retry_delay_ms, time_limit_ms, attempt_count, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?11)",
+         max_attempts, retry_delay_ms, time_limit_ms, attempt_count, created_at, updated_at, class, run_window, is_default) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11, ?11, ?12, ?13, ?14)",
         params![
             params.name,
             JobState::Queued.as_str(),
@@ -450,6 +636,9 @@ pub fn insert_job(conn: &Connection, params: &SubmitParams, now: i64) -> Result<
             params.retry_delay_ms as i64,
             params.time_limit_ms.map(i64::try_from).transpose()?,
             now,
+            params.class,
+            params.run_window.as_ref().map(ToString::to_string),
+            params.is_default,
         ],
     )?;
     let job_id = conn.last_insert_rowid();
@@ -845,21 +1034,39 @@ pub fn advance_dependency_graph(conn: &Connection, now: i64) -> Result<()> {
 /// Priority/FIFO-ordered jobs eligible for admission right now.
 pub fn eligible_candidates(conn: &Connection, now: i64) -> Result<Vec<Candidate>> {
     let mut stmt = conn.prepare(
-        "SELECT j.id, j.ready_seq, j.max_parallel_runs, j.priority FROM jobs j
+        "SELECT j.id, j.ready_seq, j.max_parallel_runs, j.priority, j.run_window, c.run_window, j.is_default
+         FROM jobs j LEFT JOIN job_classes c ON c.name = j.class
          WHERE j.state = 'queued'
            AND j.ready_seq IS NOT NULL
            AND (j.retry_not_before IS NULL OR j.retry_not_before <= ?1)
-         ORDER BY j.priority DESC, j.ready_seq ASC",
+           AND COALESCE(c.paused, 0) = 0
+         ORDER BY j.is_default ASC, j.priority DESC, j.ready_seq ASC",
     )?;
     let rows = stmt.query_map([now], |row| {
-        Ok(Candidate {
+        let job_window = window_from_row(row, 4)?;
+        let class_window = window_from_row(row, 5)?;
+        if [job_window, class_window]
+            .iter()
+            .flatten()
+            .any(|window| !window.contains(now))
+        {
+            return Ok(None);
+        }
+        Ok(Some(Candidate {
             job_id: row.get(0)?,
             ready_seq: row.get(1)?,
             limit: row.get(2)?,
             priority: row.get(3)?,
-        })
+            is_default: row.get(6)?,
+        }))
     })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    let mut candidates = Vec::new();
+    for candidate in rows {
+        if let Some(candidate) = candidate? {
+            candidates.push(candidate);
+        }
+    }
+    Ok(candidates)
 }
 
 // ---------------------------------------------------------------------------
@@ -874,17 +1081,23 @@ pub fn create_attempt_with_lease(
     launch_token: &str,
     now: i64,
 ) -> Result<AttemptRow> {
+    ensure!(
+        scheduling_reason(conn, job, now)?.is_none(),
+        "job cannot start under current class/window policy"
+    );
+    let window_end_at = window_end_at(conn, job, now)?;
     let number = job.attempt_count + 1;
     conn.execute(
-        "INSERT INTO attempts (job_id, number, state, launch_token, max_parallel_runs, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO attempts (job_id, number, state, launch_token, max_parallel_runs, created_at, window_end_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             job.id,
             number,
             AttemptState::Prepared.as_str(),
             launch_token,
             job.max_parallel_runs,
-            now
+            now,
+            window_end_at
         ],
     )?;
     let attempt_id = conn.last_insert_rowid();
@@ -926,6 +1139,22 @@ pub fn attempts_for_job(conn: &Connection, job: JobId) -> Result<Vec<AttemptRow>
         "SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE job_id = ?1 ORDER BY number"
     ))?;
     let rows = stmt.query_map([job], attempt_from_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Descending attempt numbers keep paging stable while new attempts arrive.
+pub fn attempts_page(
+    conn: &Connection,
+    job: JobId,
+    before: Option<i64>,
+    limit: u32,
+) -> Result<Vec<AttemptRow>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {ATTEMPT_COLUMNS} FROM attempts
+         WHERE job_id = ?1 AND (?2 IS NULL OR number < ?2)
+         ORDER BY number DESC LIMIT ?3"
+    ))?;
+    let rows = stmt.query_map(params![job, before, limit], attempt_from_row)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -1302,6 +1531,14 @@ pub fn lookup_operation(conn: &Connection, key: &str) -> Result<Option<(String, 
         .optional()?)
 }
 
+pub fn compact_operation_response(conn: &Connection, key: &str, response: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE operations SET response = ?2 WHERE key = ?1",
+        params![key, response],
+    )?;
+    Ok(())
+}
+
 pub fn insert_operation(
     conn: &Connection,
     key: &str,
@@ -1399,6 +1636,9 @@ mod tests {
     fn submit_params(name: &str, limit: u32) -> SubmitParams {
         SubmitParams {
             name: name.into(),
+            is_default: false,
+            class: None,
+            run_window: None,
             cwd: "/tmp".into(),
             args: vec!["true".into()],
             env: BTreeMap::new(),
@@ -1420,6 +1660,118 @@ mod tests {
         assert_eq!(version, MIGRATIONS.len() as i64);
         // Idempotent.
         migrate(&conn).unwrap();
+    }
+
+    fn add_class(conn: &Connection, name: &str, window: Option<&str>) {
+        conn.execute("INSERT INTO job_classes (name, run_window, created_at, updated_at) VALUES (?1, ?2, 0, 0)",
+            params![name, window]).unwrap();
+    }
+
+    #[test]
+    fn classes_and_both_windows_gate_admission() {
+        const HOUR: i64 = 3_600_000;
+        let conn = open_in_memory().unwrap();
+        add_class(&conn, "ablations", Some("23:00-07:00@+00:00"));
+        let mut p = submit_params("night", 4);
+        p.class = Some("ablations".into());
+        p.run_window = Some("01:00-05:00".parse().unwrap());
+        let id = insert_job(&conn, &p, 0).unwrap();
+        let row = job_row(&conn, id).unwrap().unwrap();
+        assert_eq!(row.class.as_deref(), Some("ablations"));
+        assert_eq!(row.run_window, p.run_window);
+        assert_eq!(class_jobs(&conn, "ablations").unwrap().len(), 1);
+        assert!(eligible_candidates(&conn, 23 * HOUR).unwrap().is_empty());
+        assert_eq!(eligible_candidates(&conn, HOUR).unwrap()[0].job_id, id);
+        assert_eq!(window_end_at(&conn, &row, HOUR).unwrap(), Some(5 * HOUR));
+        assert!(eligible_candidates(&conn, 5 * HOUR).unwrap().is_empty());
+        assert!(eligible_candidates(&conn, 12 * HOUR).unwrap().is_empty());
+        conn.execute(
+            "UPDATE job_classes SET paused = 1 WHERE name = 'ablations'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            scheduling_reason(&conn, &row, HOUR).unwrap(),
+            Some("class_paused")
+        );
+        assert!(eligible_candidates(&conn, HOUR).unwrap().is_empty());
+    }
+
+    #[test]
+    fn closed_high_priority_window_does_not_block_other_classes() {
+        let conn = open_in_memory().unwrap();
+        add_class(&conn, "night", Some("23:00-07:00@+00:00"));
+        let mut night = submit_params("night", 1);
+        night.priority = 100;
+        night.class = Some("night".into());
+        let closed = insert_job(&conn, &night, 0).unwrap();
+        let open = insert_job(&conn, &submit_params("open", 4), 1).unwrap();
+        let candidates = eligible_candidates(&conn, 12 * 3_600_000).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].job_id, open);
+        let reservation = crate::scheduler::ReservationSnapshot {
+            job_id: closed,
+            cutoff_seq: None,
+            consumed: BTreeSet::new(),
+        };
+        let plan = crate::scheduler::plan_pass(&[], &candidates, Some(&reservation));
+        assert!(plan.invalidate_reservation.is_some());
+        assert_eq!(plan.starts[0].job_id, open);
+    }
+
+    #[test]
+    fn attempt_snapshots_the_earliest_close_and_preserves_it() {
+        const HOUR: i64 = 3_600_000;
+        let conn = open_in_memory().unwrap();
+        add_class(&conn, "night", Some("23:00-07:00@+00:00"));
+        let mut p = submit_params("night", 2);
+        p.class = Some("night".into());
+        p.run_window = Some("22:00-04:00".parse().unwrap());
+        let id = insert_job(&conn, &p, 0).unwrap();
+        let row = job_row(&conn, id).unwrap().unwrap();
+        assert!(create_attempt_with_lease(&conn, &row, "outside", 12 * HOUR).is_err());
+        let attempt = create_attempt_with_lease(&conn, &row, "token", 23 * HOUR).unwrap();
+        assert_eq!(attempt.window_end_at, Some(28 * HOUR));
+        assert_eq!(
+            attempt_row(&conn, attempt.id)
+                .unwrap()
+                .unwrap()
+                .window_end_at,
+            Some(28 * HOUR)
+        );
+        // A live time-limit edit, including clearing it, leaves the window bound.
+        set_job_time_limit(&conn, id, None, 24 * HOUR).unwrap();
+        assert_eq!(
+            attempt_row(&conn, attempt.id)
+                .unwrap()
+                .unwrap()
+                .window_end_at,
+            Some(28 * HOUR)
+        );
+    }
+
+    #[test]
+    fn migration_preserves_existing_jobs_and_active_attempts() {
+        let conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        for migration in &MIGRATIONS[..7] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 7).unwrap();
+        conn.execute("INSERT INTO jobs (name, state, cwd, args, env, max_parallel_runs, max_attempts, retry_delay_ms, created_at, updated_at) VALUES ('old', 'running', '/unused', '[]', '{}', 1, 1, 0, 0, 0)", []).unwrap();
+        conn.execute("INSERT INTO attempts (job_id, number, state, launch_token, max_parallel_runs, created_at) VALUES (1, 1, 'running', 'old-token', 1, 0)", []).unwrap();
+        migrate(&conn).unwrap();
+        let row = job_row(&conn, 1).unwrap().unwrap();
+        assert_eq!(row.state, JobState::Running);
+        assert!(row.class.is_none());
+        assert!(row.run_window.is_none());
+        assert!(
+            attempt_row(&conn, 1)
+                .unwrap()
+                .unwrap()
+                .window_end_at
+                .is_none()
+        );
     }
 
     #[test]

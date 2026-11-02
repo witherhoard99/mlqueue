@@ -107,6 +107,20 @@ fn run(dir: &Path) -> anyhow::Result<()> {
                 Some("cancelled before launch".to_string()),
             );
         }
+        if command.window_end_at.is_some_and(|end| now_ms() >= end) {
+            log_line(
+                dir,
+                "run window closed while waiting for launch authorization",
+            );
+            return publish_result(
+                dir,
+                &command,
+                ResultOutcome::WindowClosed,
+                None,
+                None,
+                Some("run window closed before command launch".into()),
+            );
+        }
         match artifacts::read_artifact::<StartFile>(&dir.join(START_FILE)) {
             Ok(Some(start)) if start.token == command.token => break,
             Ok(Some(_)) => {
@@ -153,6 +167,17 @@ fn run(dir: &Path) -> anyhow::Result<()> {
     // Launch the command in its own process group. std::process reports
     // execve/chdir failure through its internal pipe, so a spawn error means
     // the command never ran.
+    if command.window_end_at.is_some_and(|end| now_ms() >= end) {
+        log_line(dir, "run window closed before command launch");
+        return publish_result(
+            dir,
+            &command,
+            ResultOutcome::WindowClosed,
+            None,
+            None,
+            Some("run window closed before command launch".into()),
+        );
+    }
     let stdout = log_file(dir, STDOUT_LOG_FILE)?;
     let stderr = log_file(dir, STDERR_LOG_FILE)?;
     let mut cmd = Command::new(&command.argv[0]);
@@ -230,6 +255,8 @@ fn run(dir: &Path) -> anyhow::Result<()> {
     let mut kill_at: Option<Instant> = None;
     let mut kill_sent = false;
     let mut timed_out = false;
+    let mut window_closed = false;
+    let mut committed_deadline = None;
     let mut empty_scans = 0u32;
     let grace = Duration::from_millis(command.cancel_grace_ms);
     loop {
@@ -270,17 +297,30 @@ fn run(dir: &Path) -> anyhow::Result<()> {
             live_limit = observed;
         }
         let time_limit = live_limit.ms.map(Duration::from_millis);
-        let deadline_expired = time_limit.is_some_and(|limit| command_started.elapsed() >= limit);
-        let timeout_deadline = live_limit.ms.and_then(|limit| {
+        let time_expired = time_limit.is_some_and(|limit| command_started.elapsed() >= limit);
+        let limit_deadline = live_limit.ms.and_then(|limit| {
             i64::try_from(limit)
                 .ok()
                 .and_then(|limit| command_started_at.checked_add(limit))
         });
+        let (expired, window_first) = expired_execution_deadline(
+            limit_deadline,
+            time_expired,
+            command.window_end_at,
+            now_ms(),
+        );
+        let timeout_deadline = committed_deadline.or(expired);
+        let limit_set_at = if window_closed || window_first {
+            None
+        } else {
+            live_limit.set_at
+        };
+        let deadline_expired = timed_out || expired.is_some();
         let timeout_classifies = deadline_expired
             && cancel.as_ref().is_none_or(|cancel| {
                 match (cancel.requested_at, timeout_deadline) {
                     (Some(cancelled_at), Some(deadline)) => {
-                        domain::timeout_wins_over_cancel(cancelled_at, deadline, live_limit.set_at)
+                        domain::timeout_wins_over_cancel(cancelled_at, deadline, limit_set_at)
                     }
                     // Old cancellation artifacts predate time limits and
                     // retain cancellation precedence for compatibility.
@@ -290,9 +330,10 @@ fn run(dir: &Path) -> anyhow::Result<()> {
         if deadline_expired && !group_empty {
             if timeout_classifies && !timed_out {
                 timed_out = true;
+                window_closed = window_first;
+                committed_deadline = timeout_deadline;
                 if let Some(deadline) = timeout_deadline {
-                    // Exclusive: the first commitment is the one the daemon
-                    // continues if this runner dies mid-grace.
+                    // Preserve the first deadline if the runner dies during grace.
                     let record = TimeoutFile {
                         token: command.token.clone(),
                         deadline,
@@ -304,12 +345,17 @@ fn run(dir: &Path) -> anyhow::Result<()> {
                         log_line(dir, &format!("recording timeout commitment: {err}"));
                     }
                 }
+                let reason = if window_closed {
+                    "run window closed".to_string()
+                } else {
+                    format!(
+                        "time limit of {} ms exceeded",
+                        live_limit.ms.expect("time deadline requires a limit")
+                    )
+                };
                 log_line(
                     dir,
-                    &format!(
-                        "time limit of {} ms exceeded; delivering SIGTERM to group {pgid}",
-                        live_limit.ms.expect("deadline requires a time limit")
-                    ),
+                    &format!("{reason}; delivering SIGTERM to group {pgid}"),
                 );
             }
             if !term_sent {
@@ -362,13 +408,21 @@ fn run(dir: &Path) -> anyhow::Result<()> {
     let status = exit_status.expect("loop exits only after leader exit");
     let (outcome, exit_code, term_signal, message) = if timed_out {
         (
-            ResultOutcome::TimedOut,
+            if window_closed {
+                ResultOutcome::WindowClosed
+            } else {
+                ResultOutcome::TimedOut
+            },
             status.code(),
             status.signal(),
-            Some(format!(
-                "time limit of {} ms exceeded",
-                live_limit.ms.expect("timed out requires a time limit")
-            )),
+            Some(if window_closed {
+                "run window closed".into()
+            } else {
+                format!(
+                    "time limit of {} ms exceeded",
+                    live_limit.ms.expect("timed out requires a time limit")
+                )
+            }),
         )
     } else if cancelled_before_exit {
         (
@@ -417,6 +471,22 @@ fn peek_exit(pid: i32) -> std::io::Result<Option<std::process::ExitStatus>> {
         _ => status, // CLD_KILLED: the terminating signal number
     };
     Ok(Some(std::process::ExitStatus::from_raw(raw)))
+}
+
+/// Return the earliest expired deadline and whether it came from the window.
+fn expired_execution_deadline(
+    limit: Option<i64>,
+    limit_expired: bool,
+    window: Option<i64>,
+    now: i64,
+) -> (Option<i64>, bool) {
+    let window_expired = window.filter(|&end| now >= end);
+    let limit_expired = limit.filter(|_| limit_expired);
+    match (limit_expired, window_expired) {
+        (Some(limit), Some(window)) if limit < window => (Some(limit), false),
+        (_, Some(window)) => (Some(window), true),
+        (limit, None) => (limit, false),
+    }
 }
 
 fn log_file(dir: &Path, name: &str) -> std::io::Result<File> {
@@ -501,6 +571,42 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    #[test]
+    fn run_window_deadline_survives_a_cleared_or_extended_time_limit() {
+        assert_eq!(
+            expired_execution_deadline(None, false, Some(100), 99),
+            (None, false)
+        );
+        assert_eq!(
+            expired_execution_deadline(None, false, Some(100), 100),
+            (Some(100), true)
+        );
+        assert_eq!(
+            expired_execution_deadline(Some(200), false, Some(100), 100),
+            (Some(100), true)
+        );
+        assert_eq!(
+            expired_execution_deadline(Some(50), true, Some(100), 120),
+            (Some(50), false)
+        );
+        assert_eq!(
+            expired_execution_deadline(Some(150), true, Some(100), 200),
+            (Some(100), true)
+        );
+        assert_eq!(
+            expired_execution_deadline(Some(100), true, Some(100), 100),
+            (Some(100), true)
+        );
+    }
+
+    #[test]
+    fn legacy_commands_have_no_window_deadline() {
+        let mut json = serde_json::to_value(command(None)).unwrap();
+        json.as_object_mut().unwrap().remove("window_end_at");
+        let old: CommandFile = serde_json::from_value(json).unwrap();
+        assert!(old.window_end_at.is_none());
+    }
+
     fn command(limit: Option<u64>) -> CommandFile {
         CommandFile {
             attempt_id: 1,
@@ -513,6 +619,7 @@ mod tests {
             cancel_grace_ms: 1,
             poll_ms: 10,
             time_limit_ms: limit,
+            window_end_at: None,
         }
     }
 
